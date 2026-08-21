@@ -67,3 +67,20 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Training artifacts and datasets (regenerate with python_code/)
+python_code/output/
+data/
+everyday_openimages*/
+*.pt
+*.npz
+
+# PlatformIO
+.pio/

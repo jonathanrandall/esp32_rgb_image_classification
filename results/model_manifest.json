@@ -1,0 +1,33 @@
+{
+  "format_version": 1,
+  "capture_width": 160,
+  "capture_height": 120,
+  "downsample_factor": 1,
+  "rgb_width": 32,
+  "rgb_height": 24,
+  "rgb_block_width": 5,
+  "rgb_block_height": 5,
+  "reduction": "block_mean",
+  "conv_channels": [
+    16,
+    32,
+    64
+  ],
+  "extra_conv_channels": [
+    32
+  ],
+  "num_classes": 5,
+  "class_names": [
+    "people",
+    "computer",
+    "doors",
+    "fruit",
+    "car"
+  ],
+  "output_scale": 0.050149973921888455,
+  "float_test_accuracy": 0.7815699658703071,
+  "qat_test_accuracy": 0.8100113765642776,
+  "int8_reference_test_accuracy": 0.8100113765642776,
+  "int8_vs_qat_agreement": 0.9931740614334471,
+  "cpu_inference_ms": 0.22498492005979642
+}

@@ -145,6 +145,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-yolo-filter", action="store_true",
                          help="skip the YOLO11m person-detection filter (meta/{split}_yolo_people.json, see "
                               "detect_people_yolo.py) -- keep only the Open-Images-intersections-based people filter")
+    parser.add_argument("--no-curation-filter", action="store_true",
+                         help="skip the hand-curation reject list (meta/{split}_curation_rejects.json, see "
+                              "apply_curation_rejects.py) -- keep images marked bad in manual review")
     parser.add_argument("--no-write-class-names", action="store_true",
                          help="build data/ but don't write dct_common/class_names.json -- preview-only run, "
                               "CLASS_NAMES stays whatever it currently is")
@@ -167,6 +170,7 @@ def main() -> None:
     print(f"capture: {args.capture_width}x{args.capture_height} ({args.chroma_subsampling})")
     print(f"filtering: {'off (--no-filter)' if args.no_filter else 'on (meta/-based, see filter_intersections.py)'}")
     print(f"YOLO people filter: {'off (--no-yolo-filter)' if args.no_yolo_filter else 'on (see detect_people_yolo.py)'}")
+    print(f"hand-curation filter: {'off (--no-curation-filter)' if args.no_curation_filter else 'on (see apply_curation_rejects.py)'}")
     print(f"class merges: {CLASS_MERGE_MAP if CLASS_MERGE_MAP else '(none)'}")
     print(f"classes dropped: {sorted(CLASS_DROP) if CLASS_DROP else '(none)'}")
     print(f"final class list ({len(class_names)}): {class_names}")
@@ -177,7 +181,8 @@ def main() -> None:
         shutil.rmtree(processed_dir)
     print(f"-- Step 1: merging + filtering {source_dir} -> {processed_dir} --")
     build_filtered_dataset(source_dir, processed_dir, class_map=class_map, apply_filter=not args.no_filter,
-                            apply_yolo_filter=not args.no_yolo_filter)
+                            apply_yolo_filter=not args.no_yolo_filter,
+                            apply_curation=not args.no_curation_filter)
 
     cfg = Config(
         capture_width=args.capture_width, capture_height=args.capture_height,

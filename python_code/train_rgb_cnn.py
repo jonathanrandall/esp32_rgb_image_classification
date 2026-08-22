@@ -51,6 +51,7 @@ train_cnn.py's).
 import argparse
 import json
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -114,6 +115,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--qat-epochs", type=int, default=20)
+    parser.add_argument("--data-dir", type=str, default="data",
+                         help="dataset directory to train on, relative to the project root (default: data). "
+                              "Point this at data_hand_curated for fine-tuning. Any value other than 'data' "
+                              "SKIPS ensure_dataset() -- a curated directory is hand-built and must never be "
+                              "regenerated from --dataset-source.")
+    parser.add_argument("--test-data-dir", type=str, default=None,
+                         help="where to read the test split from (default: --data-dir if it has a test/, "
+                              "else data/). Fine-tuning sets have no test/ of their own on purpose: the "
+                              "fine-tuned and base models must be scored on the same untouched split for "
+                              "the comparison to mean anything.")
+    parser.add_argument("--fine-tune-from", type=str, default=None,
+                         help="output/ subdirectory holding a trained model to initialize from, e.g. "
+                              "rgb_cnn_5x5. Loads its float_model.pt, verifies its manifest matches this "
+                              "run's architecture/reduction/class list, and trains at --fine-tune-lr "
+                              "instead of from scratch.")
+    parser.add_argument("--fine-tune-lr", type=float, default=1e-4,
+                         help="learning rate for --fine-tune-from (default: 1e-4, ~10x below the from-scratch "
+                              "rate). QAT still runs afterwards at its own rate.")
     parser.add_argument("--use-augmentation", action="store_true",
                          help="live train-split augmentation (flip/crop/rotate/brightness/contrast/blur, see "
                               "dct_common/augmentation.py), applied fresh every epoch directly to decoded pixels "
@@ -225,15 +244,82 @@ def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module) -> dict
     }
 
 
+def verify_finetune_compatible(manifest: dict, args, conv_channels: tuple, extra_conv_channels: tuple,
+                                cfg: Config) -> None:
+    """Refuse to fine-tune across a configuration change.
+
+    Everything checked here would otherwise fail either silently or far
+    downstream. A different class ORDER is the nastiest: the state dict
+    loads cleanly, training converges, and the exported header's labels
+    are simply wrong. A different reduction or architecture at least
+    fails loudly on the state-dict load, but the message is unreadable."""
+    problems = []
+
+    def check(label, want, got):
+        if want != got:
+            problems.append(f"  {label}: source run has {want!r}, this run has {got!r}")
+
+    check("conv_channels", list(manifest["conv_channels"]), list(conv_channels))
+    check("extra_conv_channels", list(manifest["extra_conv_channels"]), list(extra_conv_channels))
+    check("num_classes", manifest["num_classes"], cfg.num_classes)
+    # Order matters, not just membership -- the final Linear's rows are
+    # positional and the exported MODEL_CLASS_NAMES follows this list.
+    check("class_names (order matters)", list(manifest["class_names"]), list(cfg.active_class_names))
+    check("rgb_width", manifest["rgb_width"], args.capture_width // args.rgb_block_width
+          if args.rgb_block_width > 1 or args.rgb_block_height > 1
+          else args.capture_width // args.downsample_factor)
+    check("rgb_height", manifest["rgb_height"], args.capture_height // args.rgb_block_height
+          if args.rgb_block_width > 1 or args.rgb_block_height > 1
+          else args.capture_height // args.downsample_factor)
+    if "rgb_block_width" in manifest:
+        check("rgb_block_width", manifest["rgb_block_width"], args.rgb_block_width)
+        check("rgb_block_height", manifest["rgb_block_height"], args.rgb_block_height)
+
+    if problems:
+        raise SystemExit(
+            f"--fine-tune-from {args.fine_tune_from}: the source run's configuration does not match "
+            f"this one.\n" + "\n".join(problems) +
+            "\n\nFine-tuning only means anything when the model is otherwise identical. "
+            "Match the flags to the source run, or train from scratch.")
+
+
+def load_finetune_init(args, conv_channels: tuple, extra_conv_channels: tuple, cfg: Config) -> dict:
+    """Read and validate the source run, returning its float state dict."""
+    src_dir = Path(__file__).resolve().parent / "output" / args.fine_tune_from
+    manifest_path = src_dir / "model_manifest.json"
+    weights_path = src_dir / "float_model.pt"
+    for path in (manifest_path, weights_path):
+        if not path.exists():
+            raise SystemExit(f"--fine-tune-from {args.fine_tune_from}: {path} not found")
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    verify_finetune_compatible(manifest, args, conv_channels, extra_conv_channels, cfg)
+    print(f"  initializing from {src_dir.relative_to(Path(__file__).resolve().parent)}/float_model.pt")
+    print(f"    source run: float={manifest['float_test_accuracy']:.4f} "
+          f"qat={manifest['qat_test_accuracy']:.4f} int8={manifest['int8_reference_test_accuracy']:.4f}")
+    return torch.load(weights_path, map_location="cpu")
+
+
 def train_float_model(cfg: Config, conv_channels: tuple, extra_conv_channels: tuple, num_classes: int,
-                       device: torch.device, train_loader: DataLoader, val_loader: DataLoader) -> nn.Module:
+                       device: torch.device, train_loader: DataLoader, val_loader: DataLoader,
+                       init_state: dict | None = None, lr: float | None = None) -> nn.Module:
     set_seed(cfg.seed)
     model = RgbCnnClassifier(conv_channels, extra_conv_channels, cfg.dropout, num_classes).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    if init_state is not None:
+        model.load_state_dict(init_state)
+    lr = cfg.learning_rate if lr is None else lr
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
     criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
 
     best_val_acc, best_state, epochs_without_improvement = -1.0, None, 0
+    if init_state is not None:
+        # Score the starting point, so "did fine-tuning help?" is answerable
+        # from this log alone rather than by comparing two separate runs.
+        start = evaluate(model, val_loader, criterion)
+        print(f"  starting val_acc={start['accuracy']:.4f} (before any fine-tuning steps)")
+        best_val_acc = start["accuracy"]
+        best_state = {k: v.clone() for k, v in model.state_dict().items()}
     for epoch in range(cfg.epochs):
         model.train()
         for xb, yb in train_loader:
@@ -332,12 +418,41 @@ def main() -> None:
     device = get_device()
 
     print("\n-- Dataset --")
-    ensure_dataset(DATA_DIR, cfg, source_dir=PROJECT_ROOT / args.dataset_source)
+    train_data_dir = PROJECT_ROOT / args.data_dir
+    if args.data_dir == "data":
+        ensure_dataset(train_data_dir, cfg, source_dir=PROJECT_ROOT / args.dataset_source)
+    else:
+        # A curated directory is assembled by hand (curation_pull.py ->
+        # curation_resolve.py). ensure_dataset() would see a class/size
+        # mismatch and rebuild it from --dataset-source, silently throwing
+        # the curation away and replacing it with the uncurated data.
+        if not train_data_dir.is_dir():
+            raise SystemExit(f"--data-dir {args.data_dir}: {train_data_dir} not found")
+        print(f"  using {train_data_dir} as-is (ensure_dataset skipped -- hand-built directory)")
+
+    # The test split comes from wherever it is untouched. A fine-tuning set
+    # has no test/ of its own by design: scoring the fine-tuned model on a
+    # different test split than the base model would make the comparison
+    # meaningless.
+    if args.test_data_dir is not None:
+        test_data_dir = PROJECT_ROOT / args.test_data_dir
+    elif (train_data_dir / "test").is_dir():
+        test_data_dir = train_data_dir
+    else:
+        test_data_dir = DATA_DIR
+    if test_data_dir != train_data_dir:
+        print(f"  test split read from {test_data_dir} (--data-dir has no test/ of its own)")
+    if not (test_data_dir / "test").is_dir():
+        raise SystemExit(f"no test split found at {test_data_dir / 'test'}")
 
     print("\n-- Feature extraction --")
-    X_train, y_train, _ = (build_rgb_block_split(DATA_DIR, "train", cfg.active_class_names, args.rgb_block_width, args.rgb_block_height) if use_blocks else build_rgb_split(DATA_DIR, "train", cfg.active_class_names, rgb_width, rgb_height))
-    X_val, y_val, _ = (build_rgb_block_split(DATA_DIR, "val", cfg.active_class_names, args.rgb_block_width, args.rgb_block_height) if use_blocks else build_rgb_split(DATA_DIR, "val", cfg.active_class_names, rgb_width, rgb_height))
-    X_test, y_test, _ = (build_rgb_block_split(DATA_DIR, "test", cfg.active_class_names, args.rgb_block_width, args.rgb_block_height) if use_blocks else build_rgb_split(DATA_DIR, "test", cfg.active_class_names, rgb_width, rgb_height))
+    def load_split(dd, split):
+        return (build_rgb_block_split(dd, split, cfg.active_class_names, args.rgb_block_width, args.rgb_block_height)
+                if use_blocks else
+                build_rgb_split(dd, split, cfg.active_class_names, rgb_width, rgb_height))
+    X_train, y_train, _ = load_split(train_data_dir, "train")
+    X_val, y_val, _ = load_split(train_data_dir, "val")
+    X_test, y_test, _ = load_split(test_data_dir, "test")
     for name, X, y in (("train", X_train, y_train), ("val", X_val, y_val), ("test", X_test, y_test)):
         print(f"  {name}: X={X.shape} y={y.shape} class balance={np.bincount(y)}")
 
@@ -358,8 +473,16 @@ def main() -> None:
     test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, pin_memory=pin)
     print(f"  train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
 
-    print("\n-- Float training --")
-    float_model = train_float_model(cfg, conv_channels, extra_conv_channels, cfg.num_classes, device, train_loader, val_loader)
+    init_state = None
+    if args.fine_tune_from:
+        print("\n-- Fine-tune initialization --")
+        init_state = load_finetune_init(args, conv_channels, extra_conv_channels, cfg)
+
+    print("\n-- Float training --" if not args.fine_tune_from
+          else f"\n-- Float fine-tuning (lr={args.fine_tune_lr:g}) --")
+    float_model = train_float_model(cfg, conv_channels, extra_conv_channels, cfg.num_classes, device,
+                                     train_loader, val_loader, init_state=init_state,
+                                     lr=args.fine_tune_lr if args.fine_tune_from else None)
     eval_criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
     test_metrics = evaluate(float_model, test_loader, eval_criterion)
     print(f"  float model test accuracy: {test_metrics['accuracy']:.4f}")
@@ -414,6 +537,20 @@ def main() -> None:
         "int8_reference_test_accuracy": int8_test_accuracy,
         "int8_vs_qat_agreement": agreement,
         "cpu_inference_ms": cpu_timing["ms_per_inference"],
+        # Provenance. Recorded because "which data was this trained on, and
+        # was it fine-tuned?" is otherwise unanswerable from the artifacts --
+        # the same gap that made the shipped 5x5 model's epoch count and
+        # augmentation setting unrecoverable. argv is the whole invocation,
+        # so nothing else here has to be kept in sync by hand.
+        "data_dir": args.data_dir,
+        "test_data_dir": str(test_data_dir.relative_to(PROJECT_ROOT)),
+        "fine_tuned_from": args.fine_tune_from,
+        "fine_tune_lr": args.fine_tune_lr if args.fine_tune_from else None,
+        "epochs": cfg.epochs,
+        "qat_epochs": args.qat_epochs,
+        "use_augmentation": args.use_augmentation,
+        "seed": cfg.seed,
+        "argv": sys.argv,
     }
     with open(ARTIFACTS_DIR / "model_manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)

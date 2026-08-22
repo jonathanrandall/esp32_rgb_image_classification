@@ -23,10 +23,17 @@ python get_everyday_openimages_data.py
 ```
 
 Downloads from [Open Images V7](https://storage.googleapis.com/openimages/web/index.html)
-via FiftyOne, resizes each image (never crops) to **160x120** — the OV2640's
-native `FRAMESIZE_QQVGA` — and re-encodes as JPEG with **4:2:2** chroma
-subsampling to match what the camera actually emits. Writes
-`everyday_openimages160x120/{train,val}/<class>/`.
+via FiftyOne (plus a Places365 pass for `garden`, which has no bounding boxes).
+
+Each saved image is a **crop around one annotated object**, not a whole photo:
+the box is padded by 15%, grown to 4:3 by pulling in real neighbouring content,
+then letterboxed to **160x120** — the OV2640's native `FRAMESIZE_QQVGA`. Never
+a plain aspect-distorting resize. One crop per source photo — the largest
+detection whose box covers between 5% and 90% of the frame.
+
+Writes `everyday_openimages160x120/{train,val}/<class>/` at JPEG quality 95,
+and a 96x96 copy alongside it. The 4:2:2 re-encode that matches the camera
+happens later, in `build_data.py`.
 
 It also records, per saved image, which *other* target classes were annotated
 in the source photo, into `meta/train_intersections.json`. Nothing is dropped
@@ -230,6 +237,28 @@ matching its logits while everything still builds and runs.
 | `--seed` | int | `1234` | seeds Python, NumPy and Torch |
 | `--artifacts-name` | str | `rgb_cnn` | subdirectory of `output/` to write to |
 
+**Data source and fine-tuning**
+
+| option | type | default | meaning |
+|---|---|---|---|
+| `--data-dir` | str | `data` | dataset to train on. Any value but `data` **skips `ensure_dataset()`** |
+| `--test-data-dir` | str | auto | test split source; falls back to `data/` when `--data-dir` has no `test/` |
+| `--fine-tune-from` | str | `None` | `output/` subdirectory to initialize from instead of random weights |
+| `--fine-tune-lr` | float | `1e-4` | learning rate used with `--fine-tune-from` |
+
+`--data-dir` skipping `ensure_dataset()` for non-`data` values is deliberate,
+not an oversight: a hand-curated directory would otherwise be seen as a
+class/size mismatch and silently rebuilt from `--dataset-source`, throwing the
+curation away.
+
+`--fine-tune-from` checks the source run's manifest against this run's
+architecture, reduction, and class list **including its order**, and refuses to
+proceed on a mismatch. Order matters because the final `Linear`'s rows are
+positional — a reordered class list loads cleanly, trains happily, and exports
+a model whose labels do not match its logits.
+
+See [`../finetune_curation.md`](../finetune_curation.md) for the full workflow.
+
 `--use-augmentation` is `store_true`, so omitting it means augmentation is off;
 val and test are never augmented either way. Note this flag means something
 different here than in a DCT-domain trainer: this one applies flip / crop /
@@ -261,6 +290,7 @@ running either script bare does not mean "the run I just did", it means
 | `--chroma-subsampling` | str | `4:2:2` | `4:2:0` or `4:2:2`; the default matches the real OV2640 |
 | `--no-filter` | flag | off | merge classes but keep every image — skips `meta/`-based intersection filtering |
 | `--no-yolo-filter` | flag | off | keep the Open-Images-intersections filter, drop the YOLO11m person filter |
+| `--no-curation-filter` | flag | off | ignore the hand-curation reject list |
 | `--no-write-class-names` | flag | off | build `data/` without rewriting `dct_common/class_names.json` |
 | `--test-fraction` | float | `0.15` | fraction of each class's train images carved into `data/test/` |
 | `--seed` | int | `1234` | split seed |
@@ -283,6 +313,49 @@ for a preview run, since the default rewrites `class_names.json` in place.
 | `--source` | str | `everyday_openimages160x120` | source directory, relative to the project root |
 | `--dest` | str | `<source>_filtered` | destination directory |
 | `--no-yolo-filter` | flag | off | keep only the Open-Images-intersections filter |
+
+### Curation scripts
+
+The hand-curation loop — full walkthrough in
+[`../finetune_curation.md`](../finetune_curation.md).
+
+**`curation_pull.py`** — seeds `data_tmp/` from `data/{train,val}` on first
+run, then moves a review batch into `curation_review/`.
+
+| option | type | default | meaning |
+|---|---|---|---|
+| `--data-dir` | str | `data` | untouched dataset to seed the working pool from |
+| `--classes` | str | all | comma-separated subset to pull |
+| `--train-count` | int | `100` | train images per class per batch |
+| `--val-count` | int | `20` | val images per class per batch |
+| `--seed` | int | unseeded | reproducible sample |
+
+**`make_review_gallery.py`** — one HTML page for the whole batch with a folder
+dropdown, written to `curation_review/_review.html`. No options; takes an
+optional positional path (default `curation_review`). Re-run after every pull,
+since a `file://` page cannot enumerate directories.
+
+**`curation_resolve.py`** — accepted images to `data_hand_curated/`, rejected
+to `data_rejected/`, rejected filenames into the source `meta/`.
+
+| option | type | default | meaning |
+|---|---|---|---|
+| `--source` | str | `everyday_openimages160x120` | dataset whose `meta/` holds the durable record |
+| `--dry-run` | flag | off | report only, change nothing |
+
+**`apply_curation_rejects.py`** — folds gallery exports into the same metadata
+directly, for reviewing outside the loop.
+
+| option | type | default | meaning |
+|---|---|---|---|
+| `lists` | positional | — | `rejected_*.txt` file(s), or a directory of them |
+| `--source` | str | `everyday_openimages160x120` | dataset to resolve filenames against |
+| `--split` | str | from filename | force the source split |
+| `--remove` | flag | off | un-reject instead of reject |
+| `--dry-run` | flag | off | report only |
+
+**`make_gallery.py`** — the original one-directory contact sheet. Takes image
+directories as positional arguments, no flags.
 
 ### `get_everyday_openimages_data.py`
 

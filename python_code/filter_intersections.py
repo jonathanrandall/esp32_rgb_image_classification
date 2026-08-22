@@ -97,26 +97,64 @@ EXTRA_EXCLUDE = {}
 # meta file stores the raw confidence, not a baked-in yes/no.
 YOLO_PERSON_CONF_THRESHOLD = 0.25
 
+# Hand-curation rejects, recorded per source class as
+# meta/{split}_curation_rejects.json: {class_name: [filename, ...]}.
+#
+# WHY A LIST AND NOT A DELETED FILE: the two derived directories in this
+# pipeline (`<source>_processed/` and `data/`) are both wiped and rebuilt
+# from scratch on every build_data.py run, so curation applied by moving
+# or deleting files there evaporates the next time the taxonomy or a
+# filter setting changes. Recording the decision as metadata beside the
+# source instead makes it survive rebuilds, and keeps it small enough to
+# commit and diff -- the same reasoning get_everyday_openimages_data.py
+# already gives for storing intersections as metadata rather than baking
+# the filtering into the download.
+#
+# Populate with apply_curation_rejects.py, which converts
+# make_gallery.py's exported rejected_*.txt files into this format.
+CURATION_REJECTS_FILE = "{split}_curation_rejects.json"
+
+
+def load_curation_rejects(source_dir: Path, split: str) -> dict:
+    """{class_name: set(filenames)} from meta/{split}_curation_rejects.json.
+    Missing file is "nothing hand-rejected yet", not an error -- same
+    fallback the intersections and YOLO metadata use."""
+    path = source_dir / "meta" / CURATION_REJECTS_FILE.format(split=split)
+    if not path.exists():
+        return {}
+    return {cls: set(names) for cls, names in json.load(open(path)).items()}
+
 
 def copy_filtered_class(
     source_dir: Path, split: str, src_class_name: str, dst_class_dir: Path,
     meta: dict, apply_filter: bool = True,
     yolo_meta: dict | None = None, apply_yolo_filter: bool = True,
+    curation_rejects: dict | None = None, apply_curation: bool = True,
+    stats: dict | None = None,
 ) -> tuple:
     """Copy one source class's `split` *.jpg files into dst_class_dir
-    (created if needed), dropping any whose meta-recorded intersections
-    hit DEFAULT_EXCLUDE/EXTRA_EXCLUDE for `src_class_name`, OR whose
-    yolo_meta-recorded person-detection confidence is at least
+    (created if needed), dropping any that fail any of three independent
+    checks: meta-recorded intersections hitting
+    DEFAULT_EXCLUDE/EXTRA_EXCLUDE for `src_class_name`; a
+    yolo_meta-recorded person-detection confidence at least
     YOLO_PERSON_CONF_THRESHOLD (skipped entirely for src_class_name ==
-    "people" -- see module docstring). Returns (kept, dropped). This is
-    the one place the actual copy/filter decision lives --
-    build_filtered_dataset (below, 1:1 filtering) and build_data.py
+    "people" -- see module docstring); or an appearance in
+    `curation_rejects` (hand review, see load_curation_rejects).
+
+    Returns (kept, dropped). If `stats` is given, per-reason drop counts
+    are accumulated into it under "intersections"/"yolo"/"curation" --
+    the return shape is deliberately left alone so existing callers keep
+    working. This is the one place the actual copy/filter decision lives
+    -- build_filtered_dataset (below, 1:1 filtering) and build_data.py
     (many-to-one class merging + filtering) both call it, rather than
     each having their own copy of this loop."""
     exclude_labels = (DEFAULT_EXCLUDE | EXTRA_EXCLUDE.get(src_class_name, set())) if apply_filter else set()
     class_meta = meta.get(src_class_name, {})  # {} for garden -- no meta, nothing filtered
     class_yolo_meta = (yolo_meta or {}).get(src_class_name, {}) if src_class_name != "people" else {}
     check_yolo = apply_yolo_filter and src_class_name != "people"
+    # Unlike the people filters, hand curation DOES apply to "people":
+    # a blurred or mislabelled person crop is still a bad training image.
+    class_rejects = (curation_rejects or {}).get(src_class_name, set()) if apply_curation else set()
     src_class_dir = source_dir / split / src_class_name
     dst_class_dir.mkdir(parents=True, exist_ok=True)
 
@@ -125,9 +163,18 @@ def copy_filtered_class(
         other_classes = set(class_meta.get(jpg_path.name, []))
         if other_classes & exclude_labels:
             dropped += 1
+            if stats is not None:
+                stats["intersections"] = stats.get("intersections", 0) + 1
             continue
         if check_yolo and class_yolo_meta.get(jpg_path.name, 0.0) >= YOLO_PERSON_CONF_THRESHOLD:
             dropped += 1
+            if stats is not None:
+                stats["yolo"] = stats.get("yolo", 0) + 1
+            continue
+        if jpg_path.name in class_rejects:
+            dropped += 1
+            if stats is not None:
+                stats["curation"] = stats.get("curation", 0) + 1
             continue
         shutil.copy2(jpg_path, dst_class_dir / jpg_path.name)
         kept += 1
@@ -135,7 +182,8 @@ def copy_filtered_class(
 
 
 def build_filtered_dataset(source_dir: Path, dest_dir: Path, class_map: dict | None = None,
-                            apply_filter: bool = True, apply_yolo_filter: bool = True) -> None:
+                            apply_filter: bool = True, apply_yolo_filter: bool = True,
+                            apply_curation: bool = True) -> None:
     """class_map: {dest_class_name: [src_class_name, ...]} -- defaults to
     an identity mapping over every class folder found under
     source_dir/train (one source class per dest class, same name), this
@@ -159,17 +207,27 @@ def build_filtered_dataset(source_dir: Path, dest_dir: Path, class_map: dict | N
         if apply_yolo_filter and not yolo_meta_path.exists():
             print(f"  NOTE: {yolo_meta_path} not found -- run detect_people_yolo.py first for the YOLO-based "
                   f"people filter to have any effect on {split}; continuing with intersections-only filtering.")
+        curation_rejects = load_curation_rejects(source_dir, split) if apply_curation else {}
 
+        split_stats = {}
         for dst_class_name, src_class_names in sorted(class_map.items()):
             dst_class_dir = dest_dir / split / dst_class_name
             total_kept = total_dropped = 0
+            class_stats = {}
             for src_class_name in src_class_names:
                 kept, dropped = copy_filtered_class(source_dir, split, src_class_name, dst_class_dir, meta, apply_filter,
-                                                      yolo_meta, apply_yolo_filter)
+                                                      yolo_meta, apply_yolo_filter,
+                                                      curation_rejects, apply_curation, class_stats)
                 total_kept += kept
                 total_dropped += dropped
+            for reason, n in class_stats.items():
+                split_stats[reason] = split_stats.get(reason, 0) + n
             label = dst_class_name if src_class_names == [dst_class_name] else f"{dst_class_name} <- {'+'.join(src_class_names)}"
-            print(f"  {split}/{label}: kept {total_kept}, dropped {total_dropped}")
+            why = ", ".join(f"{reason} {n}" for reason, n in sorted(class_stats.items()) if n) or "none"
+            print(f"  {split}/{label}: kept {total_kept}, dropped {total_dropped} ({why})")
+
+        if split_stats:
+            print(f"  {split} totals: " + ", ".join(f"{r} {n}" for r, n in sorted(split_stats.items())))
 
 
 def main() -> None:
@@ -180,6 +238,9 @@ def main() -> None:
                          help="destination directory name, relative to the project root (default: <source>_filtered)")
     parser.add_argument("--no-yolo-filter", action="store_true",
                          help="skip the YOLO11m person-detection filter, keep only the Open-Images-intersections one")
+    parser.add_argument("--no-curation-filter", action="store_true",
+                         help="skip the hand-curation reject list (meta/{split}_curation_rejects.json, see "
+                              "apply_curation_rejects.py) -- keep images marked bad in manual review")
     args = parser.parse_args()
 
     source_dir = PROJECT_ROOT / args.source
@@ -188,7 +249,8 @@ def main() -> None:
         shutil.rmtree(dest_dir)
 
     print(f"Filtering {source_dir} -> {dest_dir}")
-    build_filtered_dataset(source_dir, dest_dir, apply_yolo_filter=not args.no_yolo_filter)
+    build_filtered_dataset(source_dir, dest_dir, apply_yolo_filter=not args.no_yolo_filter,
+                            apply_curation=not args.no_curation_filter)
     print("done")
 
 

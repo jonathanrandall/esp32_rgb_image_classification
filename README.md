@@ -189,6 +189,26 @@ python verify_rgb_cnn_c_export.py  rgb_cnn_5x5
 `output/rgb_cnn_5x5/`. Copy all three into `esp32_cam/esp32_rgb_cnn/include/`
 and rebuild.
 
+### Hand curation and fine-tuning
+
+Train the base model on all of `data/` untouched, then hand-curate a subset and
+fine-tune on it. Batch pull, a single review page with a folder dropdown, and a
+reject record that survives a `build_data.py` rebuild:
+
+```bash
+python python_code/curation_pull.py          # pull a batch to review
+python python_code/make_review_gallery.py    # one page, folder dropdown
+python python_code/curation_resolve.py       # accept/reject, record durably
+
+python python_code/train_rgb_cnn.py \
+    --data-dir data_hand_curated --fine-tune-from <base-run> \
+    --rgb-block-width 5 --rgb-block-height 5 \
+    --classes <same list and order as the base run> \
+    --artifacts-name <base-run>_ft
+```
+
+Full walkthrough: [`finetune_curation.md`](finetune_curation.md).
+
 Reproducibility caveat: training is seeded (`--seed`, default 1234) but
 `torch.use_deterministic_algorithms` is not set, so cuDNN's backward kernels
 give roughly 0.5–1.4 points of run-to-run variation. Differences smaller than
@@ -239,7 +259,8 @@ esp32_cam/esp32_rgb_cnn/     PlatformIO firmware
 python_code/                 training, export, verification
   dct_common/                  shared library (feature extraction, QAT, quantization)
 
-data_curation/               how the dataset was selected and filtered
+data_curation/               how the raw pull was selected and filtered
+finetune_curation.md         the hand-curation -> fine-tuning workflow
 results/                     accuracy table, confusion matrix, manifest for the shipped run
 ```
 
@@ -259,8 +280,9 @@ taken, which were deliberately left out, and why.
 
 Dataset images come from
 [Open Images V7](https://storage.googleapis.com/openimages/web/index.html) via
-[FiftyOne](https://docs.voxel51.com/), resized to 160x120 and re-encoded 4:2:2
-to match the camera. People filtering uses YOLO11m over the saved pixels, on
+[FiftyOne](https://docs.voxel51.com/) (plus a Places365 pass for `garden`).
+Each is a padded crop around one annotated object, letterboxed to 160x120 and
+re-encoded 4:2:2 to match the camera. People filtering uses YOLO11m over the saved pixels, on
 top of Open Images' own annotations — the annotations alone are incomplete,
 since they box salient objects rather than every person in every frame.
 

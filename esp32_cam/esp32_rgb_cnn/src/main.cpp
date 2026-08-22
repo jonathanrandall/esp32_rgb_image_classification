@@ -1292,6 +1292,10 @@ static void start_camera_server() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.ctrl_port = 32768;
+  // Same reasoning as the stream server below, though this one is far less
+  // exposed: its handlers all return promptly, so a stale socket here only
+  // occupies a slot rather than blocking every other request.
+  config.lru_purge_enable = true;
   config.max_uri_handlers = 5;
   config.stack_size = 8192;  // default 4096 is tight; index/status/config are light
 
@@ -1317,6 +1321,30 @@ static void start_camera_server() {
   // JSON/status buffers plus two 192-byte headers) and whatever frame2jpg()'s
   // encoder uses. 20480 keeps a wide margin over that.
   stream_config.stack_size = 20480;
+
+  // WHY THESE THREE: stream_handler() below never returns while a client is
+  // connected -- it is an infinite loop that also does the capture,
+  // classification and JPEG encode. esp_http_server services requests from a
+  // single task, so that one handler monopolises this whole server.
+  //
+  // The failure that produced: after a reflash the browser's PREVIOUS /stream
+  // connection is dead at the TCP level, but the ESP32 does not know it. The
+  // handler keeps spinning on the stale socket and the reloaded page's new
+  // request is never serviced -- port 80 still serves INDEX_HTML, so the page
+  // loads as a skeleton with no video and no predictions, which reads as a
+  // model or camera fault rather than a socket one. Observed 2026-08-22:
+  // `curl :81/stream` connected, sent the request, and received 0 bytes in
+  // 12s while /status simultaneously reported a healthy 19.4 fps.
+  //
+  // lru_purge_enable is the one that fixes it: a new connection evicts the
+  // oldest instead of queueing behind it, so a page reload always wins. The
+  // timeouts make a dead socket error out promptly rather than hang forever.
+  // 5s specifically, not less -- the DCT firmware measured sends that block
+  // 0.94-1.66s and still complete, so a 1s timeout kills healthy connections
+  // (that was esp32_classifier's second stall cause; see markdown/fix_stall.md).
+  stream_config.lru_purge_enable = true;
+  stream_config.send_wait_timeout = 5;
+  stream_config.recv_wait_timeout = 5;
 
   httpd_uri_t stream_uri = {
       .uri = "/stream", .method = HTTP_GET, .handler = stream_handler, .user_ctx = NULL};

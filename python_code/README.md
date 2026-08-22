@@ -57,8 +57,10 @@ python build_data.py
 ```
 
 Merges fine-grained source classes into the deployed taxonomy
-(`laptop` + `keyboard` + `monitor` -> `computer`; the merge map is
-edit-the-script config near the top of `build_data.py`, not a CLI flag), drops images
+(`laptop` + `keyboard` + `monitor` -> `computer`, `table` + `chair` + `couch`
+-> `furniture`, `bowls` + `plates` + `cups` -> `crockery`; the merge map and the
+drop list are edit-the-script config near the top of `build_data.py`, not CLI
+flags), drops images
 caught by either people filter, carves out a test split, and writes
 `data/{train,val,test}/<class>/*.jpg`. It also rewrites
 `dct_common/class_names.json` to match what it built — pass
@@ -81,9 +83,14 @@ See [`../data_curation/`](../data_curation/) for the selection tooling.
 ```bash
 python train_rgb_cnn.py \
     --rgb-block-width 5 --rgb-block-height 5 \
-    --classes people,computer,doors,fruit,car \
-    --artifacts-name rgb_cnn_5x5
+    --classes people,computer,doors,fruit,car,furniture,garden \
+    --use-augmentation
 ```
+
+That writes to `output/rgb_cnn` (the default `--artifacts-name`). Use a
+distinct name per configuration — `rgb_5x5_7cls`, `rgb_5x5_11cls` — if you
+train several: two runs sharing a name silently overwrite each other's weights,
+which is easy to do while iterating on the class list.
 
 Three stages, in one run:
 
@@ -108,31 +115,27 @@ Writes to `output/<artifacts-name>/`: `float_model.pt`, `qat_model.pt`,
 
 ### What the shipped weights were built with
 
-The command above is exactly what reproduces
-`esp32_cam/esp32_rgb_cnn/include/model_weights.h`. Everything not on that
-command line is a default, and those defaults are what the shipped model used:
-`--conv-channels 16,32,64`, `--extra-conv-channels 32`, `--dropout 0.3`,
-`--epochs 60`, `--qat-epochs 20`, `--seed 1234`, no `--use-augmentation`.
+`model_manifest.json` now records the full invocation, so this is recovered
+from the artifacts rather than remembered:
 
-How much of that is verifiable from the artifacts, rather than assumed:
+```
+--rgb-block-width 5 --rgb-block-height 5 --classes people,computer,doors,fruit,car,furniture,garden --use-augmentation
+```
 
-| | recorded in `model_manifest.json`? |
+| | |
 |---|---|
-| block width/height, `reduction: "block_mean"` | yes |
-| conv channels, extra conv channels | yes |
-| class list **and its order** | yes |
-| epochs, QAT epochs, augmentation, seed, argv | **no** |
+| classes | people, computer, doors, fruit, car, furniture, garden |
+| reduction | 5x5 block mean -> 32x24 |
+| architecture | conv 16,32,64 + extra 32 |
+| epochs | 60 float, 20 QAT |
+| augmentation | on |
+| seed | 1234 |
+| int8 test | 73.2% |
 
-`--classes` sets the model's class index order, and
-`people,computer,doors,fruit,car` is the order baked into `MODEL_CLASS_NAMES`
-in the shipped header — reorder that flag and the firmware's labels silently
-stop matching its logits.
-
-The bottom row is the gap: there is no run log either, so epochs, augmentation
-and seed are inferred from the script defaults rather than confirmed. A
-session that used `--use-augmentation` or a different epoch count would not be
-reproduced by this command. Nothing reproduces bit-for-bit regardless, for the
-cuDNN reason above.
+`--classes` sets the model's class index order, and that order is baked into
+`MODEL_CLASS_NAMES` in the exported header — reorder the flag and the
+firmware's labels silently stop matching its logits. `--fine-tune-from`
+refuses to proceed across a mismatch for exactly this reason.
 
 **On reproducibility.** `--seed` seeds Python, NumPy and Torch, but
 `torch.use_deterministic_algorithms` is *not* set, so cuDNN's nondeterministic
@@ -146,14 +149,24 @@ getting 81.9% where 81.1% was recorded.
 ## 3. Export and verify
 
 ```bash
-python export_rgb_cnn_c_weights.py rgb_cnn_5x5
-python verify_rgb_cnn_c_export.py  rgb_cnn_5x5
+python export_to_firmware.py                 # the `rgb_cnn` run
+python export_to_firmware.py --upload        # ...and flash it
+python export_to_firmware.py rgb_5x5_ft --dry-run
+```
+
+That wrapper is the recommended path — see its entry in the
+[CLI reference](#cli-reference). The two underlying scripts can still be run
+directly:
+
+```bash
+python export_rgb_cnn_c_weights.py rgb_cnn
+python verify_rgb_cnn_c_export.py  rgb_cnn
 ```
 
 Both take the `output/` subdirectory name as their single argument and default
 to `rgb_cnn` if omitted.
 
-The exporter writes `output/rgb_cnn_5x5/esp32/`:
+The exporter writes `output/<run>/esp32/`:
 
 - `model_weights.h` — int8 weights, quantized multipliers, and a complete
   `model_forward()`. Carries **both** conv paths behind
@@ -165,7 +178,7 @@ The exporter writes `output/rgb_cnn_5x5/esp32/`:
 The verifier writes the self-test vector headers the firmware compiles in —
 `rgb_synth_vectors.h` (LCG + structured patterns) and `rgb_real_images.h` (two
 real test-split images) — plus a standalone `verify_rgb_export.c` harness and
-its compiled binary, into `output/rgb_cnn_5x5/`.
+its compiled binary, into `output/<run>/`.
 
 It re-extracts features from the real test JPEGs — using
 `extract_rgb_blocks` when the manifest says `reduction: "block_mean"` — runs
@@ -174,9 +187,10 @@ This is the check that catches layout mistakes; the QAT-vs-int8 agreement
 number from training does not, because both sides of that comparison are
 Python.
 
-To deploy, copy `output/rgb_cnn_5x5/esp32/model_weights.h` plus
-`output/rgb_cnn_5x5/rgb_synth_vectors.h` and `rgb_real_images.h` into
-`esp32_cam/esp32_rgb_cnn/include/` and rebuild.
+Note the two scripts write to **different directories**. `export_to_firmware.py`
+exists mainly because of that asymmetry — copying only `model_weights.h` leaves
+the boot self-test comparing a new model against another model's expected
+logits, which fails on device with no hint as to the cause.
 
 ---
 
@@ -313,6 +327,29 @@ for a preview run, since the default rewrites `class_names.json` in place.
 | `--source` | str | `everyday_openimages160x120` | source directory, relative to the project root |
 | `--dest` | str | `<source>_filtered` | destination directory |
 | `--no-yolo-filter` | flag | off | keep only the Open-Images-intersections filter |
+
+**`export_to_firmware.py`** — the whole deploy in one command: export, verify,
+back up, install, optionally build. Prefer it over running the two scripts by
+hand, since they write to *different* directories (the exporter produces
+`model_weights.h`, the **verifier** produces the two self-test vector headers)
+and copying only the first leaves the device self-test comparing a new model
+against another model's expected logits.
+
+| option | type | default | meaning |
+|---|---|---|---|
+| `run` | positional | `rgb_cnn` | `output/` subdirectory to deploy |
+| `--firmware` | str | `esp32_cam/esp32_rgb_cnn` | PlatformIO project root |
+| `--skip-export` | flag | off | reuse existing generated headers |
+| `--skip-verify` | flag | off | skip the bit-exactness check (don't) |
+| `--force` | flag | off | install even if the firmware already matches |
+| `--build` | flag | off | run `pio run` afterwards |
+| `--upload` | flag | off | build and flash |
+| `--dry-run` | flag | off | report only |
+
+It refuses to install anything the verifier did not pass, checks the four
+files agree with each other, and prints a per-class precision and
+predicted-share table — warning when a class is predicted far more often than
+it occurs, which is the over-prediction that balanced accuracy cannot see.
 
 ### Curation scripts
 

@@ -94,9 +94,25 @@ DATA_DIR = PROJECT_ROOT / "data"
 # separate. Merging the two removes that particular decision boundary
 # instead of asking the model to keep drawing it.
 CLASS_MERGE_MAP = {
-    "furniture": ["table", "chair", "couch", "bookshelves"],
+    # 2026-08-22: `bookshelves` split out of `furniture` and `cutlery` out of
+    # what was `eating_tools`, which is renamed `crockery` now that it holds
+    # only dishes.
+    #
+    # Both merges had been grouping things that share a word but not an
+    # appearance, which is what the model actually sees -- and at 32x24 input
+    # it sees very little. A bookshelf and a couch have no common shape,
+    # texture or context; forks and plates likewise. `furniture` was the
+    # weakest non-`people` class in the 7-class model (precision 63.4%,
+    # recall 69.2%) and the first to collapse under fine-tuning (recall 51%),
+    # which is the signature of a label covering several visual concepts.
+    #
+    # `bookshelves` and `cutlery` are NOT dropped -- they pass through as
+    # their own classes (build_data.py's default for anything neither merged
+    # nor dropped), so they stay available and can be excluded at training
+    # time with --classes rather than by another rebuild.
+    "furniture": ["table", "chair", "couch"],
     "computer": ["laptop", "keyboard", "monitor"],
-    "eating_tools": ["bowls", "plates", "cups", "cutlery"],
+    "crockery": ["bowls", "plates", "cups"],
 }
 
 # Source classes dropped entirely -- not merged into anything, not

@@ -16,18 +16,38 @@
   "extra_conv_channels": [
     32
   ],
-  "num_classes": 5,
+  "num_classes": 7,
   "class_names": [
     "people",
     "computer",
     "doors",
     "fruit",
-    "car"
+    "car",
+    "furniture",
+    "garden"
   ],
-  "output_scale": 0.050149973921888455,
-  "float_test_accuracy": 0.7815699658703071,
-  "qat_test_accuracy": 0.8100113765642776,
-  "int8_reference_test_accuracy": 0.8100113765642776,
-  "int8_vs_qat_agreement": 0.9931740614334471,
-  "cpu_inference_ms": 0.22498492005979642
+  "output_scale": 0.052244171382874016,
+  "float_test_accuracy": 0.7203525641025641,
+  "qat_test_accuracy": 0.7331730769230769,
+  "int8_reference_test_accuracy": 0.7323717948717948,
+  "int8_vs_qat_agreement": 0.9911858974358975,
+  "cpu_inference_ms": 0.20978082000510767,
+  "data_dir": "data",
+  "test_data_dir": "data",
+  "fine_tuned_from": null,
+  "fine_tune_lr": null,
+  "epochs": 60,
+  "qat_epochs": 20,
+  "use_augmentation": true,
+  "seed": 1234,
+  "argv": [
+    "train_rgb_cnn.py",
+    "--rgb-block-width",
+    "5",
+    "--rgb-block-height",
+    "5",
+    "--classes",
+    "people,computer,doors,fruit,car,furniture,garden",
+    "--use-augmentation"
+  ]
 }

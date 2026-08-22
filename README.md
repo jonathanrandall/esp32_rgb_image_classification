@@ -5,9 +5,10 @@ domain**: the camera is read as raw RGB565, reduced to a 32x24 grid by
 averaging 5x5 blocks of pixels, and classified by a small int8 CNN running
 under [ESP-NN](https://github.com/espressif/esp-nn).
 
-Five classes: `people`, `computer`, `doors`, `fruit`, `car`.
+Seven classes: `people`, `computer`, `doors`, `fruit`, `car`, `furniture`,
+`garden`.
 
-**81.0% int8 test accuracy on 2,304 input values per frame.** Everything here
+**73.2% int8 test accuracy on 2,304 input values per frame**, 73.8% balanced. Everything here
 — training, quantization, C export, bit-exactness verification, and the
 firmware — is what produced the weights in
 `esp32_cam/esp32_rgb_cnn/include/model_weights.h`.
@@ -48,6 +49,11 @@ architecture, same data:
 4x4 scores the same as 5x5 while carrying 56% more data, so its extra values
 buy nothing. Past 5x5 the curve breaks — 8x8 gives up three points.
 
+> This sweep was measured on an earlier **5-class** taxonomy, which is why its
+> numbers are higher than the shipped model's. It is kept because the *shape*
+> of the curve — where the knee is — is what chose 5x5, and that is what it
+> shows. Do not compare its absolute values against the table below.
+
 A useful property falls out of this input: block means are centered to
 `[-128, 127]`, which is *already exactly int8*. The input quantizer's scale is
 1.0 and nothing needs calibrating.
@@ -61,20 +67,33 @@ shipped weights:
 
 | split | float | QAT | int8 |
 |---|---:|---:|---:|
-| train | 90.7% | 96.1% | 96.1% |
-| val | 79.9% | 81.0% | 80.8% |
-| test | 78.2% | **81.0%** | **81.0%** |
+| train | 74.3% | 77.2% | 78.7% |
+| val | 71.1% | 71.8% | 71.1% |
+| test | 72.0% | 73.3% | **73.2%** |
 
-int8-vs-QAT prediction agreement: **99.3%**. The int8 reference is bit-exact
+Balanced (macro-averaged per-class recall), which weights every class equally:
+**73.8%** on test.
+
+int8-vs-QAT prediction agreement: **99.1%**. The int8 reference is bit-exact
 against the C export — see *Verification* below.
 
 QAT scoring above float is not a typo; quantization noise acts as a
 regularizer on a model this small.
 
-For on-device latency, read it from the board rather than from this file:
-`GET /status` reports `capture_ms`, `convert_ms`, `infer_ms`, `jpeg_ms` and
-`total_ms` per frame, plus a per-layer breakdown. (For scale: the 4x4 variant
-measured 33 ms of inference on the same board; 5x5 is smaller.)
+Measured on the board via `GET /status`, which reports per-frame timing and a
+per-layer breakdown:
+
+| stage | ms |
+|---|---:|
+| RGB565 -> block-mean convert | 3.5 |
+| **inference** | **21.0** |
+| JPEG encode (for the preview stream) | 18.8 |
+| total | 43.5 |
+
+19.3 fps end to end. Note the JPEG encode is nearly as expensive as the
+inference: capturing RGB565 means the frame cannot double as the stream, so
+previewing costs a software encode. That is a property of the pixel-domain
+pipeline, not of the model.
 
 ---
 
@@ -175,19 +194,19 @@ python build_data.py
 # 2. train: float -> QAT -> bit-exact int8
 python train_rgb_cnn.py \
     --rgb-block-width 5 --rgb-block-height 5 \
-    --classes people,computer,doors,fruit,car \
-    --artifacts-name rgb_cnn_5x5
+    --classes people,computer,doors,fruit,car,furniture,garden \
+    --use-augmentation
 
 # 3. export C weights and verify them against the Python int8 reference
-python export_rgb_cnn_c_weights.py rgb_cnn_5x5
-python verify_rgb_cnn_c_export.py  rgb_cnn_5x5
+python export_to_firmware.py --upload
 ```
 
-`export_rgb_cnn_c_weights.py` writes `output/rgb_cnn_5x5/esp32/model_weights.h`;
-`verify_rgb_cnn_c_export.py` writes the self-test vector headers
-(`rgb_synth_vectors.h`, `rgb_real_images.h`) beside it in
-`output/rgb_cnn_5x5/`. Copy all three into `esp32_cam/esp32_rgb_cnn/include/`
-and rebuild.
+`export_to_firmware.py` runs the exporter and the verifier in order, refuses to
+install anything the verifier did not pass, backs up the headers it replaces,
+and flashes. Doing it by hand is easy to get wrong: the exporter writes
+`model_weights.h`, but the **verifier** writes the two self-test vector headers,
+one directory up — copy only the first and the boot self-test compares a new
+model against another model's expected logits.
 
 ### Hand curation and fine-tuning
 

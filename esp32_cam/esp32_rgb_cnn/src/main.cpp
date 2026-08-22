@@ -1053,6 +1053,16 @@ static const char *STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 // board can report both the with-encode and without-encode pipeline, which is
 // the honest way to present it: the RGB pipeline's cost depends on whether
 // you need the image, and the DCT pipeline's does not.
+// TODO(design): this handler does capture, conversion, inference AND JPEG
+// encoding inline, and never returns while a client is connected. Since
+// esp_http_server serves requests from a single task, that means: nothing runs
+// with no viewer, only one viewer is ever possible, a reload wedges the stream
+// until send_wait_timeout fires (~5s), and /status on port 80 contends for the
+// camera and model mutex. Four symptoms, one cause.
+//
+// The fix is to move the pipeline into its own task and leave this handler
+// shipping the latest published JPEG. Written up, with the measured evidence
+// and the buffer-ownership traps, in markdown/stream_handler_refactor.md.
 static esp_err_t stream_handler(httpd_req_t *req) {
   camera_fb_t *fb = NULL;
   esp_err_t res = ESP_OK;

@@ -160,8 +160,9 @@ it right for free.
 
 ## Training pipeline
 
-Full detail in [`python_code/README.md`](python_code/README.md). The short
-version:
+Full detail in [`python_code/README.md`](python_code/README.md), including a
+[complete CLI reference](python_code/README.md#cli-reference) — every option in
+every script, with its default. The short version:
 
 ```bash
 cd python_code

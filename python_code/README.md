@@ -87,29 +87,45 @@ Three stages, in one run:
    model, then scored against it. Agreement below ~99% means something in the
    quantization is wrong.
 
-The reduction is the interesting knob:
+The reduction is the interesting knob. Block averaging and Lanczos are two
+different reductions and the script refuses to combine them. Block averaging is
+the one this project uses, because an 8x8 block mean is exactly the JPEG DC
+coefficient divided by 8, which makes it the equal-resolution control for a DCT
+classifier rather than just another downsampler.
 
-| flag | meaning |
-|---|---|
-| `--rgb-block-width` / `--rgb-block-height` | average `w x h` pixel blocks down to one input value (default 8) |
-| `--downsample-factor` | Lanczos resize instead of block averaging — mutually exclusive with the two above |
-| `--classes` | comma-separated subset; **order here sets the model's class index order** |
-| `--artifacts-name` | output directory under `output/` (default `rgb_cnn`) |
-
-Block averaging and Lanczos are two different reductions and the script
-refuses to combine them. Block averaging is the one this project uses, because
-an 8x8 block mean is exactly the JPEG DC coefficient divided by 8, which makes
-it the equal-resolution control for a DCT classifier rather than just another
-downsampler.
-
-Architecture flags: `--conv-channels` (default `16,32,64`; first stage stride
-1, every later stage stride 2), `--extra-conv-channels` (default `32`;
-same-resolution stages appended, empty string for none), `--dropout`,
-`--epochs` (60), `--qat-epochs` (20), `--use-augmentation`, `--seed` (1234).
+Full flag reference with defaults: [CLI reference](#cli-reference) below.
 
 Writes to `output/<artifacts-name>/`: `float_model.pt`, `qat_model.pt`,
 `quantized_model.npz`, `model_manifest.json`, `accuracy_table.json`,
 `confusion_matrix.json`.
+
+### What the shipped weights were built with
+
+The command above is exactly what reproduces
+`esp32_cam/esp32_rgb_cnn/include/model_weights.h`. Everything not on that
+command line is a default, and those defaults are what the shipped model used:
+`--conv-channels 16,32,64`, `--extra-conv-channels 32`, `--dropout 0.3`,
+`--epochs 60`, `--qat-epochs 20`, `--seed 1234`, no `--use-augmentation`.
+
+How much of that is verifiable from the artifacts, rather than assumed:
+
+| | recorded in `model_manifest.json`? |
+|---|---|
+| block width/height, `reduction: "block_mean"` | yes |
+| conv channels, extra conv channels | yes |
+| class list **and its order** | yes |
+| epochs, QAT epochs, augmentation, seed, argv | **no** |
+
+`--classes` sets the model's class index order, and
+`people,computer,doors,fruit,car` is the order baked into `MODEL_CLASS_NAMES`
+in the shipped header — reorder that flag and the firmware's labels silently
+stop matching its logits.
+
+The bottom row is the gap: there is no run log either, so epochs, augmentation
+and seed are inferred from the script defaults rather than confirmed. A
+session that used `--use-augmentation` or a different epoch count would not be
+reproduced by this command. Nothing reproduces bit-for-bit regardless, for the
+cuDNN reason above.
 
 **On reproducibility.** `--seed` seeds Python, NumPy and Torch, but
 `torch.use_deterministic_algorithms` is *not* set, so cuDNN's nondeterministic
@@ -154,6 +170,137 @@ Python.
 To deploy, copy `output/rgb_cnn_5x5/esp32/model_weights.h` plus
 `output/rgb_cnn_5x5/rgb_synth_vectors.h` and `rgb_real_images.h` into
 `esp32_cam/esp32_rgb_cnn/include/` and rebuild.
+
+---
+
+## CLI reference
+
+Every option in every script here, with its default. Extracted from the
+`add_argument` calls themselves, not transcribed by hand.
+
+### `train_rgb_cnn.py`
+
+**Reduction** — how the 160x120 capture becomes the model's input grid.
+
+| option | type | default | meaning |
+|---|---|---|---|
+| `--rgb-block-width` | int | `8` | average this many pixels horizontally into one input value |
+| `--rgb-block-height` | int | `8` | as above, vertically |
+| `--downsample-factor` | int | `1` | Lanczos resize to `(capture_w/f) x (capture_h/f)` instead; `1` = full resolution |
+
+Two traps here. First, block averaging is **on by default** — the default 8x8
+already produces a 20x15 grid, so a bare `python train_rgb_cnn.py` is not
+training on full-resolution pixels. For full resolution you must pass
+`--rgb-block-width 1 --rgb-block-height 1`. Second, the two reductions are
+mutually exclusive and the check is `width > 1 or height > 1`, so
+`--downsample-factor` is rejected outright unless both block dimensions are
+explicitly set to 1.
+
+**Dataset** — these describe how `data/` was built, i.e. the source JPEGs. They
+are not model parameters.
+
+| option | type | default | meaning |
+|---|---|---|---|
+| `--capture-width` | int | `160` | `data/`'s build resolution, multiple of 16 |
+| `--capture-height` | int | `120` | `data/`'s build resolution |
+| `--chroma-subsampling` | str | `4:2:2` | `4:2:0` or `4:2:2`; only affects `ensure_dataset()`'s build/reuse check — irrelevant to this model's own RGB decode |
+| `--dataset-source` | str | `everyday_openimages160x120` | source directory to build `data/` from, relative to the project root |
+| `--classes` | str | `None` (all) | comma-separated subset |
+
+`--classes` deserves emphasis: **the order you write it in becomes the model's
+class index order**, and that order is baked into `MODEL_CLASS_NAMES` in the
+exported header. Reorder the flag and the firmware's labels silently stop
+matching its logits while everything still builds and runs.
+
+**Architecture**
+
+| option | type | default | meaning |
+|---|---|---|---|
+| `--conv-channels` | str | `16,32,64` | main conv stack widths; first stage stride 1, every later stage stride 2 |
+| `--extra-conv-channels` | str | `32` | extra stride-1 stages appended after the main stack; `""` for none |
+| `--dropout` | float | `0.3` | before the final `Linear` |
+
+**Training**
+
+| option | type | default | meaning |
+|---|---|---|---|
+| `--epochs` | int | `60` | float stage |
+| `--qat-epochs` | int | `20` | QAT stage |
+| `--use-augmentation` | flag | **off** | live train-split augmentation, re-rolled every epoch |
+| `--seed` | int | `1234` | seeds Python, NumPy and Torch |
+| `--artifacts-name` | str | `rgb_cnn` | subdirectory of `output/` to write to |
+
+`--use-augmentation` is `store_true`, so omitting it means augmentation is off;
+val and test are never augmented either way. Note this flag means something
+different here than in a DCT-domain trainer: this one applies flip / crop /
+rotate / brightness / contrast / blur directly to decoded pixels and varies
+them every epoch, because there is no JPEG round trip to preserve.
+
+`--artifacts-name` is the one to remember. It defaults to `rgb_cnn`, so
+repeated bare runs **overwrite each other**.
+
+### `export_rgb_cnn_c_weights.py` and `verify_rgb_cnn_c_export.py`
+
+Neither uses `argparse`. Each takes one optional positional argument:
+
+| position | default | meaning |
+|---|---|---|
+| `1` | `rgb_cnn` | the `output/` subdirectory to read |
+
+Anything beyond the first argument is ignored. The default is a real hazard —
+running either script bare does not mean "the run I just did", it means
+`output/rgb_cnn/`, which may be an unrelated older model. Always pass the name.
+
+### `build_data.py`
+
+| option | type | default | meaning |
+|---|---|---|---|
+| `--source` | str | `everyday_openimages160x120` | source directory, relative to the project root |
+| `--capture-width` | int | `160` | multiple of 16 |
+| `--capture-height` | int | `120` | multiple of 16 under 4:2:0, of 8 under 4:2:2 |
+| `--chroma-subsampling` | str | `4:2:2` | `4:2:0` or `4:2:2`; the default matches the real OV2640 |
+| `--no-filter` | flag | off | merge classes but keep every image — skips `meta/`-based intersection filtering |
+| `--no-yolo-filter` | flag | off | keep the Open-Images-intersections filter, drop the YOLO11m person filter |
+| `--no-write-class-names` | flag | off | build `data/` without rewriting `dct_common/class_names.json` |
+| `--test-fraction` | float | `0.15` | fraction of each class's train images carved into `data/test/` |
+| `--seed` | int | `1234` | split seed |
+
+The class merge map and the drop list are **edit-the-script config near the top
+of `build_data.py`**, not CLI flags. `--no-write-class-names` is what you want
+for a preview run, since the default rewrites `class_names.json` in place.
+
+### `detect_people_yolo.py`
+
+| option | type | default | meaning |
+|---|---|---|---|
+| `--source` | str | `everyday_openimages160x120` | source directory, relative to the project root |
+| `--batch-size` | int | `64` | YOLO11m inference batch |
+
+### `filter_intersections.py`
+
+| option | type | default | meaning |
+|---|---|---|---|
+| `--source` | str | `everyday_openimages160x120` | source directory, relative to the project root |
+| `--dest` | str | `<source>_filtered` | destination directory |
+| `--no-yolo-filter` | flag | off | keep only the Open-Images-intersections filter |
+
+### `get_everyday_openimages_data.py`
+
+No CLI options at all — everything is module-level constants near the top of
+the file. The ones worth knowing before a download:
+
+| constant | default | meaning |
+|---|---|---|
+| `RESOLUTIONS` | `[160x120, 96x96]` | output sizes written |
+| `TRAIN_PER_CLASS` | `1000` | target saved images per class, train |
+| `VAL_PER_CLASS` | `100` | target saved images per class, val |
+| `DOWNLOAD_MULTIPLIER` | `4.0` | over-fetch factor, since many candidates fail the area filters |
+| `MIN_OBJECT_AREA` / `MAX_OBJECT_AREA` | `0.05` / `0.90` | reject boxes too small or too frame-filling |
+| `CROP_PADDING` | `0.15` | padding around the box |
+| `JPEG_QUALITY` | `95` | re-encode quality |
+| `RANDOM_SEED` | `42` | selection seed |
+| `VAL_FRACTION` | `0.10` | `garden` only — Places365 has no separate val split here |
+| `CLASS_MAP` | — | Open Images label -> class name |
 
 ---
 

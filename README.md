@@ -5,10 +5,9 @@ domain**: the camera is read as raw RGB565, reduced to a 32x24 grid by
 averaging 5x5 blocks of pixels, and classified by a small int8 CNN running
 under [ESP-NN](https://github.com/espressif/esp-nn).
 
-Seven classes: `people`, `computer`, `doors`, `fruit`, `car`, `furniture`,
-`garden`.
+Five classes: `people`, `computer`, `doors`, `fruit`, `car`.
 
-**73.2% int8 test accuracy on 2,304 input values per frame**, 73.8% balanced. Everything here
+**81.3% int8 test accuracy on 2,304 input values per frame**, 78.9% balanced. Everything here
 — training, quantization, C export, bit-exactness verification, and the
 firmware — is what produced the weights in
 `esp32_cam/esp32_rgb_cnn/include/model_weights.h`.
@@ -49,10 +48,10 @@ architecture, same data:
 4x4 scores the same as 5x5 while carrying 56% more data, so its extra values
 buy nothing. Past 5x5 the curve breaks — 8x8 gives up three points.
 
-> This sweep was measured on an earlier **5-class** taxonomy, which is why its
-> numbers are higher than the shipped model's. It is kept because the *shape*
-> of the curve — where the knee is — is what chose 5x5, and that is what it
-> shows. Do not compare its absolute values against the table below.
+> This sweep was measured on an earlier build of the dataset and with the
+> narrower `16,32,64` conv stack. It is kept because the *shape* of the curve —
+> where the knee is — is what chose 5x5, and that is what it shows. Do not read
+> its absolute values against the table below.
 
 A useful property falls out of this input: block means are centered to
 `[-128, 127]`, which is *already exactly int8*. The input quantizer's scale is
@@ -67,14 +66,14 @@ shipped weights:
 
 | split | float | QAT | int8 |
 |---|---:|---:|---:|
-| train | 74.3% | 77.2% | 78.7% |
-| val | 71.1% | 71.8% | 71.1% |
-| test | 72.0% | 73.3% | **73.2%** |
+| train | 83.4% | 85.3% | 86.5% |
+| val | 82.0% | 82.5% | 82.2% |
+| test | 80.2% | 81.3% | **81.3%** |
 
 Balanced (macro-averaged per-class recall), which weights every class equally:
-**73.8%** on test.
+**78.9%** on test.
 
-int8-vs-QAT prediction agreement: **99.1%**. The int8 reference is bit-exact
+int8-vs-QAT prediction agreement: **99.7%**. The int8 reference is bit-exact
 against the C export — see *Verification* below.
 
 QAT scoring above float is not a typo; quantization noise acts as a
@@ -194,8 +193,8 @@ python build_data.py
 # 2. train: float -> QAT -> bit-exact int8
 python train_rgb_cnn.py \
     --rgb-block-width 5 --rgb-block-height 5 \
-    --classes people,computer,doors,fruit,car,furniture,garden \
-    --use-augmentation
+    --classes people,computer,doors,fruit,car \
+    --conv-channels 32,32,64 --use-augmentation
 
 # 3. export C weights and verify them against the Python int8 reference
 python export_to_firmware.py --upload
@@ -273,6 +272,7 @@ esp32_cam/esp32_rgb_cnn/     PlatformIO firmware
   include/rgb_test_vectors.h   hand-written: the harness that runs all three tiers
   include/camera_pins.h        Freenove ESP32-S3-WROOM pinout
   lib/esp_nn/                  vendored from espressif/esp-nn (see VENDORED_FROM.md)
+  speed_up.md                  what made inference fast, and where the headroom still is
   network_info.json            the shipped model's manifest
 
 python_code/                 training, export, verification
@@ -280,6 +280,7 @@ python_code/                 training, export, verification
 
 data_curation/               how the raw pull was selected and filtered
 finetune_curation.md         the hand-curation -> fine-tuning workflow
+stream_stall_issue.md        why the stream stalls, and why that caused resets
 results/                     accuracy table, confusion matrix, manifest for the shipped run
 ```
 

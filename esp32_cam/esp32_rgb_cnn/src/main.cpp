@@ -1,12 +1,14 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
+#include "esp_log.h"      // esp_log_level_set() -- see init_camera()
 #include "esp_camera.h"
 #include "img_converters.h"  // frame2jpg() -- see the streaming note in stream_handler()
 #include "esp_http_server.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"  // heap_caps_malloc -- model buffers, see alloc_model_buffers()
 #include "lwip/sockets.h"   // setsockopt/TCP_NODELAY on the stream socket, see stream_handler()
+#include "esp_system.h"    // esp_reset_reason() -- why the last reboot happened, see /status
 #include "esp_wifi.h"       // esp_wifi_get_ps() -- verify power save is really off, see connect_wifi()
 #include <math.h>
 
@@ -76,6 +78,39 @@ static_assert(MODEL_NUM_STAGES == 7, "g_stage_us must match MODEL_NUM_STAGES");
 // the same vendor kernels.
 
 // Device will be reachable at http://esp32cam.local/
+// ---------------------------------------------------------------------------
+// SOFTAP MODE. Comment this line out to go back to joining your normal WiFi.
+// ---------------------------------------------------------------------------
+//
+// Why it exists: streaming stalls on this board track RSSI -- frame age climbs
+// to 1.5s while the device keeps computing a frame every ~36ms, so the work is
+// getting done and the bytes are not getting out. Measured on the house
+// network: ping to the board avg 368ms / max 1722ms / 2.5% loss, against avg
+// 5.7ms to the gateway from the same machine. SoftAP removes the router hop,
+// the shared channel, and every other device competing for airtime.
+//
+// The cost, which is real: the board becomes its own network with NO INTERNET,
+// so whatever you view from has to join it. A laptop with ethernet sidesteps
+// this (WiFi joins the board, ethernet keeps the internet). A phone keeps
+// cellular but will nag about "no internet connection".
+//
+// Channel is worth choosing deliberately -- see SOFTAP_CHANNEL below.
+// #define SOFTAP
+
+#ifdef SOFTAP
+#define SOFTAP_SSID     "esp32cam"
+#define SOFTAP_PASSWORD "esp321234"   // >=8 chars, or the AP silently starts open
+// 1, 6 and 11 are the only non-overlapping 2.4GHz channels. If the stream is
+// still poor, try the other two -- SoftAP removes contention from YOUR network
+// but not from the neighbours', and RSSI cannot see that (it measures signal,
+// not interference).
+#define SOFTAP_CHANNEL  6
+// One client is the design point: this firmware serves exactly one /stream
+// viewer anyway (see g_stream_claim), so a second association buys nothing and
+// costs airtime.
+#define SOFTAP_MAX_CLIENTS 2
+#endif
+
 #define MDNS_HOSTNAME "esp32cam"
 #define STREAM_PORT 81
 
@@ -102,8 +137,8 @@ static httpd_handle_t stream_httpd = NULL;
 // quality 12 out of 100, which is why the stream looked bad and frames were an
 // implausibly small ~1.3KB for 160x120. Kept as two separately named constants
 // so the confusion cannot recur.
-#define SENSOR_JPEG_QUALITY 12   // 0-63, lower = better (sensor hardware encoder)
-#define JPEG_ENCODE_QUALITY 80   // 1-100, higher = better (jpge software encoder)
+#define SENSOR_JPEG_QUALITY 12   // 12 0-63, lower = better (sensor hardware encoder)
+#define JPEG_ENCODE_QUALITY 20   // 1-100, higher = better (jpge software encoder) 80
 
 // Runtime-settable via /config?jq=N so quality/bandwidth/encode-time can be
 // swept without a reflash -- encode time is one of the measured pipeline
@@ -180,6 +215,34 @@ static volatile bool g_selftest_running = false;
 // figure is annotated with the client count rather than left to be quoted out
 // of context.
 static volatile int g_stream_clients = 0;
+
+// STREAM TAKEOVER. Bumped by GET /claim on port 80; the running stream handler
+// watches it and returns when it changes, freeing port 81 for the new client.
+//
+// WHY THIS EXISTS. stream_handler() below never returns while a client is
+// connected, and esp_http_server services a server's requests from ONE task.
+// So the port-81 task is inside that handler and cannot accept -- a second
+// connection is never serviced, and there is nothing the server can do about
+// it. That is not a timeout problem: measured 2026-08-22, Firefox held two
+// ESTAB sockets on :81 (connection pooling keeps an abandoned stream socket
+// open), the stale one owned the handler, and the visible tab got nothing
+// until Firefox was quit entirely. Closing the tab did not help.
+//
+// lru_purge_enable does NOT solve this. It fires only when max_open_sockets is
+// exhausted, and it runs on the accept path -- the same blocked task.
+// send_wait_timeout does not either: writes to a live-but-ignored socket
+// succeed, so nothing ever errors.
+//
+// The way out is that port 80 is a SEPARATE httpd instance with its own task,
+// whose handlers all return promptly. It is always responsive, so it can carry
+// the "I want the stream" signal that port 81 cannot hear.
+static volatile uint32_t g_stream_claim = 0;
+
+// An incumbent ignores claims for this long after it starts, so two clients
+// that both claim cannot kick each other in a tight loop. The claim is a
+// counter, not an edge, so it is not lost during the grace period -- only
+// deferred.
+#define STREAM_CLAIM_GRACE_US 1500000
 
 static bool alloc_model_buffers() {
   if (!model_init()) {
@@ -456,6 +519,13 @@ static volatile float g_t_stage_output_ms = 0.0f;
 
 static volatile uint32_t g_jpeg_bytes = 0;
 
+// Wall-clock of the last JPEG chunk that left the device, so /status can
+// report how stale the stream is. The page's watchdog needs it: with the video
+// in an <iframe>, the page cannot observe frame arrival directly the way the
+// old fetch()-based reader could, so "is the stream alive?" has to come from
+// the device instead. 0 = nothing sent since boot, reported as -1.
+static volatile int64_t g_last_frame_us = 0;
+
 // Byte-order diagnostic, refreshed once/sec from the live frame.
 static volatile float g_mean_r_noswap = 0, g_mean_g_noswap = 0, g_mean_b_noswap = 0;
 static volatile float g_mean_r_swap = 0, g_mean_g_swap = 0, g_mean_b_swap = 0;
@@ -525,7 +595,13 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <title>ESP32-S3 RGB CNN (160x120)</title>
   <style>
     body { background:#111; color:#eee; font-family:sans-serif; text-align:center; margin:0; padding:16px; }
-    canvas { border:2px solid #444; border-radius:8px; image-rendering:pixelated; }
+    /* The video is an <iframe> pointed straight at :81/stream, NOT a
+       <canvas> fed by fetch(). See the script below for why. overflow is
+       left visible deliberately: border-radius + overflow:hidden + a
+       transformed child is a known bad combination in WebKit and cropped
+       the right edge on iPhone in the sibling firmware. */
+    #streamBox { display:inline-block; border:2px solid #444; border-radius:8px; width:160px; height:120px; }
+    #streamFrame { display:block; width:160px; height:120px; border:none; image-rendering:pixelated; }
     #fps { font-size:1.4em; margin:12px; }
     #timing { font-size:0.9em; color:#aaa; margin-bottom:12px; }
     #scores { max-width:320px; margin:0 auto 16px; text-align:left; }
@@ -561,7 +637,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div id="scores"></div>
   <div id="timing"></div>
   <div class="stream-row">
-    <canvas id="stream"></canvas>
+    <div id="streamBox"><iframe id="streamFrame" src=""></iframe></div>
     <div class="panel">
       <h3>inference stages (live)</h3>
       <div id="stageRows"></div>
@@ -578,8 +654,6 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     </div>
   </div>
   <script>
-    const canvas = document.getElementById('stream');
-    const ctx = canvas.getContext('2d');
 
     const stageLabels = {
       quantize: 'quantize',
@@ -606,9 +680,55 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }
     }
 
+    // Frame count at the previous poll. A DECREASE means the device reset --
+    // that counter only ever climbs while running. Worth surfacing because a
+    // reboot and a watchdog reload look identical from the sofa (the video
+    // goes black either way) and have completely different causes: a reload
+    // means the link stalled, a reboot on an ESP32-CAM usually means the
+    // supply browned out under WiFi TX current, which gets worse exactly when
+    // the link is marginal and the radio is retrying hardest.
+    let lastFrames = -1, reboots = 0;
+    // Set when the device is seen to have restarted, or to have sent nothing
+    // since boot. pollStatus() acts on it. Kept as a flag rather than
+    // reloading from updateStatus() so every reload goes through one place.
+    let needReload = '';
+    let noFramePolls = 0;
+
     function updateStatus(j) {
+      const f = (j.signal && typeof j.signal.frames === 'number') ? j.signal.frames : -1;
+      if (lastFrames >= 0 && f >= 0 && f < lastFrames) {
+        reboots++;
+        // The device restarted, so whatever connection the iframe held is dead
+        // and will never produce another frame. Nothing else notices this: see
+        // the -1 case below for why the age-based watchdog cannot.
+        needReload = 'device reset';
+      }
+      if (f >= 0) lastFrames = f;
+
+      const age = (typeof j.last_frame_age_ms === 'number') ? j.last_frame_age_ms : -1;
+      // RSSI sits next to frame age deliberately: the two together separate a
+      // link stall from a device stall. Age climbing WITH a weak RSSI is radio;
+      // age climbing while RSSI stays strong exonerates the link and points at
+      // the send path or contention from the /status poll on the other port.
+      // In SoftAP mode the board has no station association, so RSSI is not a
+      // thing it can report -- showing "0dBm" would look like a catastrophic
+      // link rather than an inapplicable field. Show the joined-client count
+      // instead, which is the useful number in that mode.
+      const rssi = (typeof j.rssi === 'number') ? j.rssi : null;
+      const linkText = j.softap
+        ? 'ap clients ' + (typeof j.ap_clients === 'number' ? j.ap_clients : '?')
+        : 'rssi ' + (rssi === null ? '--' : rssi + 'dBm');
       document.getElementById('fps').textContent =
-        'FPS: ' + j.fps.toFixed(1) + (j.stream_jpeg ? '' : '  (JPEG encode disabled)');
+        'FPS: ' + j.fps.toFixed(1) + (j.stream_jpeg ? '' : '  (JPEG encode disabled)') +
+        '   [frame age ' + (age < 0 ? '--' : age + 'ms') +
+        ' | ' + linkText +
+        ' | reloads ' + reloads + ' | resets ' + reboots + ']' +
+        // Only shown when the last boot was NOT a normal power-up or reset
+        // button press. Keeps the line quiet in the ordinary case and loud in
+        // exactly the case that needs acting on -- and each value points at a
+        // different fix, so the word itself is the diagnosis.
+        (j.reset_reason && j.reset_reason !== 'poweron' && j.reset_reason !== 'external'
+           ? '   last reset: ' + j.reset_reason : '');
 
       const scoresDiv = document.getElementById('scores');
       scoresDiv.innerHTML = '';
@@ -715,113 +835,127 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     async function setSwap(v) { try { await fetch('/config?swap=' + v); } catch (e) {} }
     async function setJpeg(v) { try { await fetch('/config?jpeg=' + v); } catch (e) {} }
 
-    async function renderJpegPart(bytes) {
-      try {
-        const blob = new Blob([bytes], { type: 'image/jpeg' });
-        const bitmap = await createImageBitmap(blob);
-        if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
-          canvas.width = bitmap.width;
-          canvas.height = bitmap.height;
-          canvas.style.width = (bitmap.width * 2) + 'px';
-          canvas.style.height = (bitmap.height * 2) + 'px';
-        }
-        ctx.drawImage(bitmap, 0, 0);
-        bitmap.close();
-      } catch (e) {
-        // A single malformed/partial frame isn't worth tearing down the
-        // connection over -- just skip it.
-      }
+    // 2026-08-23 rewrite -- this used to fetch() the multipart stream manually
+    // (ReadableStream reader, split on the boundary, JPEG parts to <canvas>,
+    // JSON status parts interleaved on the same connection). That works in
+    // Firefox but FAILS ON IPHONE SAFARI: the page loads, the canvas stays
+    // blank, and the catch prints "stream disconnected" forever.
+    //
+    // Not a guess -- the sibling DCT firmware hit the identical thing on
+    // 2026-08-14 and root-caused it on-device (see esp32_classifier's
+    // INDEX_HTML for the full write-up):
+    //   - Navigating Safari straight to http://<ip>:81/stream streams live.
+    //     So the firmware, the network path, and Safari's OWN
+    //     multipart/x-mixed-replace support are all fine.
+    //   - The fetch() path specifically fails with "TypeError: Load failed",
+    //     most consistent with a cross-origin restriction: this page is
+    //     served from port 80 and the stream lives on port 81, which makes
+    //     the fetch cross-origin. Access-Control-Allow-Origin: * on the
+    //     stream response does not rescue it.
+    //
+    // Fix: do not fetch() the video at all. <iframe src=".../stream">
+    // navigation is not subject to what fetch() hit, and is the exact
+    // mechanism confirmed working on the phone.
+    //
+    // Cost, stated plainly: status can no longer ride the stream connection,
+    // so it goes back to a separate poll. That reopens the two-connection
+    // radio contention the interleaving existed to close (streaming_stall_
+    // fix_port.md Sec 5). Mitigated by polling only once a second, and by
+    // /status being SAME-ORIGIN (port 80, like this page), so it does not
+    // share fetch()'s failure mode here.
+    let reloads = 0;
+
+    function streamUrl() {
+      return 'http://' + window.location.hostname + ':81/stream';
     }
 
-    function indexOfBytes(hay, needle, from) {
-      outer: for (let i = from; i <= hay.length - needle.length; i++) {
-        for (let j = 0; j < needle.length; j++) {
-          if (hay[i + j] !== needle[j]) continue outer;
-        }
-        return i;
-      }
-      return -1;
+    // Claim the single stream slot before (re)connecting. The board serves one
+    // client at a time; /claim on port 80 tells the incumbent to stand down.
+    async function claimStream() {
+      try { await fetch('/claim', {cache: 'no-store'}); } catch (e) { /* booting */ }
     }
 
-    // Reads a multipart/x-mixed-replace stream from url, calling
-    // onPart(contentType, bodyBytes) for each complete part as it arrives.
-    // The firmware interleaves a JSON status part into the same connection
-    // the JPEG frames go out on (once/sec), so this page reads ONE connection
-    // instead of polling /status separately -- a separate poll was measured
-    // to contend with /stream for the ESP32-S3's single WiFi radio.
-    async function streamMultipart(url, onPart) {
-      const resp = await fetch(url);
-      if (!resp.ok) throw new Error('stream fetch failed: ' + resp.status);
-      const contentType = resp.headers.get('Content-Type') || '';
-      const boundaryMatch = /boundary=(.+)$/i.exec(contentType);
-      if (!boundaryMatch) throw new Error('no boundary in stream Content-Type');
-      const boundaryBytes = new TextEncoder().encode('--' + boundaryMatch[1].trim());
-      const sepBytes = new TextEncoder().encode('\r\n\r\n');
-      const decoder = new TextDecoder();
-
-      const reader = resp.body.getReader();
-      let buf = new Uint8Array(0);
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) return;
-        if (value && value.length) {
-          const merged = new Uint8Array(buf.length + value.length);
-          merged.set(buf, 0);
-          merged.set(value, buf.length);
-          buf = merged;
-        }
-
-        while (true) {
-          const boundaryIdx = indexOfBytes(buf, boundaryBytes, 0);
-          if (boundaryIdx === -1) break;
-          const headerStart = boundaryIdx + boundaryBytes.length;
-          const sepIdx = indexOfBytes(buf, sepBytes, headerStart);
-          if (sepIdx === -1) break; // headers not fully arrived yet
-
-          const headerText = decoder.decode(buf.slice(headerStart, sepIdx));
-          const lengthMatch = /Content-Length:\s*(\d+)/i.exec(headerText);
-          const typeMatch = /Content-Type:\s*([^\r\n]+)/i.exec(headerText);
-          if (!lengthMatch) {
-            buf = buf.slice(sepIdx + sepBytes.length);
-            continue;
-          }
-
-          const bodyLen = parseInt(lengthMatch[1], 10);
-          const bodyStart = sepIdx + sepBytes.length;
-          const bodyEnd = bodyStart + bodyLen;
-          if (buf.length < bodyEnd) break; // body not fully arrived yet
-
-          onPart(typeMatch ? typeMatch[1].trim() : '', buf.slice(bodyStart, bodyEnd));
-          buf = buf.slice(bodyEnd);
-        }
-      }
+    async function reloadStream(why) {
+      reloads++;
+      await claimStream();
+      const f = document.getElementById('streamFrame');
+      // Assign the new src DIRECTLY -- do not blank it first. The sibling DCT
+      // firmware blanks (f.src='' then reconnect after 250ms) because it has
+      // no way to evict the incumbent connection, so it must drop its own end.
+      // Here claimStream() above has already told the device to let go, and
+      // navigating the iframe aborts the old load anyway. Blanking only adds a
+      // visible black flash on every watchdog fire, which on a marginal link
+      // is often -- and on camera it reads as the model crashing.
+      // Cache-bust so the browser opens a new connection rather than reusing
+      // the dead response.
+      f.src = streamUrl() + '?r=' + Date.now();
+      console.log('stream watchdog: reloading (' + why + '), reload #' + reloads);
     }
 
-    async function runStream() {
-      const url = 'http://' + window.location.hostname + ':81/stream';
+    async function pollStatus() {
       while (true) {
         try {
-          await streamMultipart(url, (type, body) => {
-            if (type === 'image/jpeg') {
-              renderJpegPart(body);
-            } else if (type === 'application/json') {
-              try {
-                updateStatus(JSON.parse(new TextDecoder().decode(body)));
-              } catch (e) { /* one bad status part isn't worth resetting the connection over */ }
-            }
-          });
+          const resp = await fetch('/status', {cache: 'no-store'});
+          if (!resp.ok) throw new Error('status fetch failed: ' + resp.status);
+          const j = await resp.json();
+          updateStatus(j);
+          // With the video in an iframe the page cannot see frames arrive, so
+          // liveness comes from the device. Must stay comfortably above
+          // stream_config.send_wait_timeout (5s) or one slow patch triggers a
+          // reload loop -- reloading costs far more than the stall it fixes.
+          // -1 means the device has sent NO frame since boot. That is not a
+          // large age, it is the absence of one, and an `age > 8000` test can
+          // never catch it -- which is exactly how a reboot used to leave the
+          // page stuck until it was refreshed by hand. Treat a run of them as
+          // "nobody is streaming", but allow a few polls first so a fresh boot
+          // or a just-claimed slot is not fought over.
+          if (j.last_frame_age_ms === -1) {
+            if (++noFramePolls >= 3) needReload = 'no frame since device boot';
+          } else {
+            noFramePolls = 0;
+          }
+          if (typeof j.last_frame_age_ms === 'number' && j.last_frame_age_ms > 8000) {
+            needReload = 'no frame for ' + j.last_frame_age_ms + 'ms';
+          }
+          if (needReload) {
+            const why = needReload;
+            needReload = '';
+            noFramePolls = 0;
+            await reloadStream(why);
+            await new Promise(r => setTimeout(r, 3000)); // let it re-establish
+          }
         } catch (e) {
-          document.getElementById('fps').textContent = 'FPS: (stream disconnected, retrying...)';
+          document.getElementById('fps').textContent =
+            'FPS: (status fetch failed: ' + (e && e.message ? e.message : String(e)) + ' -- retrying...)';
         }
         await new Promise(r => setTimeout(r, 1000));
       }
     }
-    runStream();
+
+    (async function start() {
+      await claimStream();
+      document.getElementById('streamFrame').src = streamUrl();
+      pollStatus();
+    })();
   </script>
 </body>
 </html>
 )rawliteral";
+
+// GET /claim -- "I am about to open the stream; whoever has it should let go."
+// Deliberately on port 80, whose handlers all return promptly, so it stays
+// answerable while port 81 is stuck inside stream_handler(). See
+// g_stream_claim above for why that is the only channel available.
+static esp_err_t claim_handler(httpd_req_t *req) {
+  g_stream_claim++;
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  char buf[64];
+  int n = snprintf(buf, sizeof(buf), "{\"claim\":%u,\"holders\":%d}",
+                   (unsigned)g_stream_claim, g_stream_clients);
+  return httpd_resp_send(req, buf, n);
+}
 
 static esp_err_t index_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html");
@@ -834,6 +968,35 @@ static esp_err_t index_handler(httpd_req_t *req) {
 
 // Current WiFi power-save mode as a short string for /status. Read live
 // (not cached from boot) so a mode change after association is visible.
+// Why the chip last restarted. Captured once in setup() because the reason is
+// latched at boot and reading it later is still valid, but caching makes the
+// intent obvious: this describes the PREVIOUS boot, not a live condition.
+//
+// This exists because resets were observed while streaming and there was no way
+// to tell what kind. The candidates need opposite fixes: BROWNOUT means the
+// supply sags under WiFi TX current (fix the power -- bulk capacitor, better
+// cable), PANIC means a crash (fix the code), TASK_WDT/INT_WDT means something
+// blocked too long. Guessing between them wastes hours, and Serial is not
+// reachable over USB on this board (ARDUINO_USB_CDC_ON_BOOT=0 -- Serial goes to
+// UART0), so the boot message is invisible. Hence: report it over HTTP.
+static const char *g_reset_reason = "unknown";
+
+static const char *reset_reason_name(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "poweron";
+    case ESP_RST_EXT:       return "external";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "int_wdt";
+    case ESP_RST_TASK_WDT:  return "task_wdt";
+    case ESP_RST_WDT:       return "other_wdt";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_SDIO:      return "sdio";
+    default:                return "unknown";
+  }
+}
+
 static const char *wifi_ps_name() {
   wifi_ps_type_t ps;
   if (esp_wifi_get_ps(&ps) != ESP_OK) return "unknown";
@@ -882,9 +1045,11 @@ static int build_status_json(char *buf, size_t bufsize) {
   int off = snprintf(
       buf, bufsize,
       "{\"fps\":%.1f,\"t_capture_ms\":%.1f,\"t_convert_ms\":%.1f,\"t_infer_ms\":%.1f,"
-      "\"t_jpeg_ms\":%.1f,\"t_total_ms\":%.1f,\"jpeg_bytes\":%u,\"stream_jpeg\":%s,\"jpeg_quality\":%d,"
+      "\"t_jpeg_ms\":%.1f,\"t_total_ms\":%.1f,\"jpeg_bytes\":%u,\"last_frame_age_ms\":%d,"
+      "\"stream_jpeg\":%s,\"jpeg_quality\":%d,"
       "\"esp_nn\":%s,\"bench_contended\":%s,"
       "\"rssi\":%d,\"free_heap\":%u,\"free_psram\":%u,\"wifi_ps\":\"%s\","
+      "\"reset_reason\":\"%s\",\"min_free_heap\":%u,\"softap\":%s,\"ap_clients\":%d,"
       "\"stages\":["
       "{\"name\":\"quantize\",\"ms\":%.2f},"
       "{\"name\":\"conv0\",\"ms\":%.2f},"
@@ -907,13 +1072,30 @@ static int build_status_json(char *buf, size_t bufsize) {
       "\"swap\":{\"r\":%.1f,\"g\":%.1f,\"b\":%.1f,\"rough\":%.2f}},"
       "\"buffers\":[",
       g_fps, g_t_capture_ms, g_t_convert_ms, g_t_infer_ms, g_t_jpeg_ms, g_t_total_ms,
-      (unsigned)g_jpeg_bytes, g_stream_jpeg ? "true" : "false", g_jpeg_quality,
+      (unsigned)g_jpeg_bytes,
+      g_last_frame_us ? (int)((esp_timer_get_time() - g_last_frame_us) / 1000) : -1,
+      g_stream_jpeg ? "true" : "false", g_jpeg_quality,
       BUILD_HAS_ESP_NN ? "true" : "false", g_bench_contended ? "true" : "false",
       // RSSI/free-heap as standing diagnostics: a weak link (worse than about
       // -75 dBm) or a shrinking heap would each produce stall-like streaming
       // symptoms that look identical from the browser.
+      // In SoftAP mode WiFi.RSSI() describes a station association this board
+      // does not have, and returns a meaningless value. The page keys its
+      // stall diagnosis off this number, so reporting garbage would actively
+      // mislead. 0 is used as "not applicable"; the page shows the client
+      // count instead.
+#ifdef SOFTAP
+      0, (unsigned)ESP.getFreeHeap(),
+#else
       (int)WiFi.RSSI(), (unsigned)ESP.getFreeHeap(),
+#endif
       (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), wifi_ps_name(),
+      g_reset_reason, (unsigned)esp_get_minimum_free_heap_size(),
+#ifdef SOFTAP
+      "true", WiFi.softAPgetStationNum(),
+#else
+      "false", 0,
+#endif
       g_t_stage_quantize_ms, g_t_stage_conv0_ms, g_t_stage_conv1_ms, g_t_stage_conv2_ms,
       g_t_stage_conv3_ms, g_t_stage_pool_ms, g_t_stage_output_ms, g_bench_quantize_ms,
       g_bench_conv0_ms, g_bench_conv1_ms, g_bench_conv2_ms, g_bench_conv3_ms, g_bench_pool_ms,
@@ -1088,6 +1270,12 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     }
   }
 
+  // Snapshot the claim counter: any later change means a newer client has
+  // asked for the stream, and this handler should stand down.
+  const uint32_t my_claim = g_stream_claim;
+  const int64_t session_start = esp_timer_get_time();
+  bool yielded = false;
+
   int64_t last_report = esp_timer_get_time();
   uint32_t frames_since_report = 0;
   int64_t last_classify_log = 0;
@@ -1099,6 +1287,13 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   uint8_t *rgb888 = g_rgb888;
 
   while (true) {
+    if (g_stream_claim != my_claim &&
+        esp_timer_get_time() - session_start > STREAM_CLAIM_GRACE_US) {
+      Serial.println("stream: yielding to a newer client (/claim)");
+      yielded = true;
+      break;
+    }
+
     int64_t t_capture_start = esp_timer_get_time();
     fb = esp_camera_fb_get();
     int64_t t_capture_end = esp_timer_get_time();
@@ -1257,6 +1452,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
       if (res == ESP_OK) res = httpd_resp_send_chunk(req, part_buf, hlen);
       if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)jpg_buf, jpg_len);
+      if (res == ESP_OK) g_last_frame_us = esp_timer_get_time();
       free(jpg_buf);
       jpg_buf = NULL;
     }
@@ -1271,22 +1467,31 @@ static esp_err_t stream_handler(httpd_req_t *req) {
       last_report = now;
     }
 
-    // Push status as an interleaved multipart part on this SAME connection
-    // rather than having the page poll /status separately -- the separate
-    // poll was measured to contend with /stream for the ESP32-S3's single
-    // WiFi radio (round-trip 300ms isolated vs 700-1300ms during streaming,
-    // with outright stream stalls).
-    if (res == ESP_OK && now - last_status_push >= 1000000) {
-      int status_len = build_status_json(status_buf, sizeof(status_buf));
-      size_t status_hlen = snprintf(status_hdr, sizeof(status_hdr), "%s" STREAM_JSON_PART_FMT,
-                                    STREAM_BOUNDARY, (unsigned)status_len);
-      if (status_hlen >= sizeof(status_hdr)) status_hlen = sizeof(status_hdr) - 1;
-
-      res = httpd_resp_send_chunk(req, status_hdr, status_hlen);
-      if (res == ESP_OK) res = httpd_resp_send_chunk(req, status_buf, status_len);
-      last_status_push = now;
-      if (res != ESP_OK) break;
-    }
+    // NO interleaved status part here. This used to push a
+    // Content-Type: application/json part onto this same connection once a
+    // second, so the page got frames and status over one connection and did
+    // not have to poll /status separately (that poll was measured to contend
+    // for the ESP32-S3's single WiFi radio -- 300ms round-trip isolated vs
+    // 700-1300ms during streaming, with outright stalls).
+    //
+    // That only works while the CLIENT parses the multipart itself. The page
+    // now renders the video in an <iframe> instead, because Safari refuses the
+    // cross-origin fetch() the old reader needed (port 80 page -> port 81
+    // stream). A browser rendering multipart/x-mixed-replace natively swaps
+    // the displayed document for EVERY part it receives -- so a JSON part
+    // replaces the picture with a JSON body, once per second, which shows up
+    // as the video going black intermittently. Diagnosed 2026-08-23 with
+    // reloads=0 and resets=0 on the page's own counters, which ruled out both
+    // the watchdog and a device reset and left only what the stream itself was
+    // sending.
+    //
+    // Status now goes over a separate same-origin poll of /status on port 80.
+    // The radio contention that motivated the interleaving is real and comes
+    // back; it is the accepted cost of working on iPhone at all. The sibling
+    // DCT firmware made the same trade on 2026-08-14.
+    (void)last_status_push;
+    (void)status_buf;
+    (void)status_hdr;
 
     // With the JPEG encode disabled there is no image write in this loop, so
     // nothing yields to lower-priority tasks except the once-a-second status
@@ -1294,8 +1499,12 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     // stays fed.
     if (!g_stream_jpeg) vTaskDelay(1);
   }
+  if (fb) esp_camera_fb_return(fb);
   g_stream_clients--;
-  return res;
+  // Ending the response lets httpd close the socket promptly instead of
+  // leaving the client waiting on a chunked body that will never continue.
+  if (yielded) httpd_resp_send_chunk(req, NULL, 0);
+  return yielded ? ESP_OK : res;
 }
 
 static void start_camera_server() {
@@ -1314,11 +1523,14 @@ static void start_camera_server() {
       .uri = "/status", .method = HTTP_GET, .handler = status_handler, .user_ctx = NULL};
   httpd_uri_t config_uri = {
       .uri = "/config", .method = HTTP_GET, .handler = config_handler, .user_ctx = NULL};
+  httpd_uri_t claim_uri = {
+      .uri = "/claim", .method = HTTP_GET, .handler = claim_handler, .user_ctx = NULL};
 
   if (httpd_start(&camera_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(camera_httpd, &index_uri);
     httpd_register_uri_handler(camera_httpd, &status_uri);
     httpd_register_uri_handler(camera_httpd, &config_uri);
+    httpd_register_uri_handler(camera_httpd, &claim_uri);
   }
 
   httpd_config_t stream_config = HTTPD_DEFAULT_CONFIG();
@@ -1411,6 +1623,27 @@ static bool init_camera() {
     config.fb_location = CAMERA_FB_IN_DRAM;
   }
 
+  // SILENCE THE CAMERA DRIVER'S LOGGING. This is not tidiness, it is a crash
+  // fix.
+  //
+  // Decoded panic, 2026-08-23: "Stack canary watchpoint triggered (cam_task)",
+  // backtrace cam_hal.c:196 -> esp_log_write -> vprintf -> newlib stdio locks
+  // -> xQueueCreateMutex. cam_task blew its stack INSIDE the log call. The
+  // driver's frame-buffer-overflow warning drags in the whole newlib vprintf
+  // machinery, which needs far more stack than cam_task is given, so the act of
+  // reporting the problem is what kills the board.
+  //
+  // The overflow it was reporting is real and has a cause: when the WiFi send
+  // stalls (frame ages up to 1.5s were measured), the stream loop stops
+  // returning frame buffers, the driver runs out, and it logs. So a bad link
+  // escalated into a reset. Silencing the log does not fix the link -- it stops
+  // a recoverable, self-correcting condition from becoming a crash.
+  //
+  // Set BEFORE esp_camera_init() so it also covers logging during init.
+  esp_log_level_set("cam_hal", ESP_LOG_NONE);
+  esp_log_level_set("s3 ll_cam", ESP_LOG_NONE);
+  esp_log_level_set("camera", ESP_LOG_NONE);
+
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x\n", err);
@@ -1451,6 +1684,35 @@ static bool init_camera() {
 
   return true;
 }
+
+#ifdef SOFTAP
+// Bring up the board's own access point instead of joining an existing
+// network. Deliberately NOT a fallback if the station connect fails -- silently
+// changing which network the board is on would be a worse failure than not
+// coming up at all, because the page would simply be unreachable with no
+// indication why.
+static void start_softap() {
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);   // an AP should never sleep; clients depend on it
+  bool ok = WiFi.softAP(SOFTAP_SSID, SOFTAP_PASSWORD, SOFTAP_CHANNEL,
+                        /*ssid_hidden=*/0, SOFTAP_MAX_CLIENTS);
+  if (!ok) {
+    Serial.println("FATAL: softAP() failed to start.");
+    return;
+  }
+  Serial.printf("SoftAP up: SSID \"%s\"  channel %d  max clients %d\n",
+                SOFTAP_SSID, SOFTAP_CHANNEL, SOFTAP_MAX_CLIENTS);
+  Serial.print("  join that network, then open: http://");
+  Serial.println(WiFi.softAPIP());
+
+  // Same reasoning as the station path: power save adds DTIM-interval latency,
+  // which is exactly the profile that turns a smooth stream into bursts.
+  WiFi.setSleep(false);
+  wifi_ps_type_t ps = WIFI_PS_NONE;
+  if (esp_wifi_get_ps(&ps) == ESP_OK)
+    Serial.printf("WiFi power save mode: %s\n", ps == WIFI_PS_NONE ? "NONE (good)" : "(!! not NONE)");
+}
+#endif
 
 static void connect_wifi() {
   WiFi.mode(WIFI_STA);
@@ -1668,14 +1930,46 @@ static void run_inference_benchmark() {
   // conv2d_int8, so each conv stage IS the kernel -- these MMAC/s figures are
   // now directly comparable to the repack-excluded kernel column measured on
   // the previous CHW build (conv0 41.9, conv1 169.1, conv2 270.3, conv3 403.3).
-  Serial.printf("  conv0    %7.2f ms  (3->16ch,  120x160,  8.29M MAC) %7.1f MMAC/s\n",
-                g_bench_conv0_ms, 8.2944f * 1000.0f / g_bench_conv0_ms);
-  Serial.printf("  conv1    %7.2f ms  (16->32ch, 60x80,   22.12M MAC) %7.1f MMAC/s\n",
-                g_bench_conv1_ms, 22.1184f * 1000.0f / g_bench_conv1_ms);
-  Serial.printf("  conv2    %7.2f ms  (32->64ch, 30x40,   22.12M MAC) %7.1f MMAC/s\n",
-                g_bench_conv2_ms, 22.1184f * 1000.0f / g_bench_conv2_ms);
-  Serial.printf("  conv3    %7.2f ms  (64->32ch, 30x40,   22.12M MAC) %7.1f MMAC/s\n",
-                g_bench_conv3_ms, 22.1184f * 1000.0f / g_bench_conv3_ms);
+  // Output channel counts read from the generated arrays themselves. There are
+  // no MODEL_CONVn_CHANNELS macros, but each bias array holds exactly one entry
+  // per output channel, so sizeof gives it at compile time and it cannot go
+  // stale on a retrain.
+  const int CONV0_OUT_CH = (int)(sizeof(CONV0_BIAS) / sizeof(CONV0_BIAS[0]));
+  const int CONV1_OUT_CH = (int)(sizeof(CONV1_BIAS) / sizeof(CONV1_BIAS[0]));
+  const int CONV2_OUT_CH = (int)(sizeof(CONV2_BIAS) / sizeof(CONV2_BIAS[0]));
+
+  // MAC counts derived from the CURRENT model's shapes, not hardcoded.
+  //
+  // They used to be literals ("3->16ch, 120x160, 8.29M MAC") describing a model
+  // this firmware had long since stopped running, and the MMAC/s column divided
+  // those stale counts by live timings. On 2026-08-23 that produced "561 MMAC/s
+  // for conv0 against 6161 for conv3" -- wrong by more than an order of
+  // magnitude, and wrong in a way that looks entirely plausible. The
+  // milliseconds were always real; only the derived columns lied. Deriving them
+  // from MODEL_* means they cannot drift again on a retrain.
+  //
+  // Strides mirror the exporter: first conv stage 1, later stages 2, extra
+  // stages 1. See dct_common/models/rgb_cnn.py::_conv_stage_strides.
+  const uint32_t c0_macs = (uint32_t)MODEL_RGB_WIDTH * MODEL_RGB_HEIGHT * CONV0_OUT_CH * 3 * 9;
+  const uint32_t s2_w = (MODEL_RGB_WIDTH + 1) / 2, s2_h = (MODEL_RGB_HEIGHT + 1) / 2;
+  const uint32_t c1_macs = s2_w * s2_h * CONV1_OUT_CH * CONV0_OUT_CH * 9;
+  const uint32_t s4_w = (s2_w + 1) / 2, s4_h = (s2_h + 1) / 2;
+  const uint32_t c2_macs = s4_w * s4_h * CONV2_OUT_CH * CONV1_OUT_CH * 9;
+  const uint32_t c3_macs = s4_w * s4_h * MODEL_FINAL_CHANNELS * CONV2_OUT_CH * 9;
+  const uint32_t tot_macs = c0_macs + c1_macs + c2_macs + c3_macs;
+
+  Serial.printf("  conv0    %7.2f ms  (3->%dch, %ux%u, %.2fM MAC) %7.1f MMAC/s  [%.1f%% of MACs]\n",
+                g_bench_conv0_ms, CONV0_OUT_CH, (unsigned)MODEL_RGB_WIDTH, (unsigned)MODEL_RGB_HEIGHT,
+                c0_macs / 1e6f, c0_macs / 1e3f / g_bench_conv0_ms, 100.0f * c0_macs / tot_macs);
+  Serial.printf("  conv1    %7.2f ms  (%d->%dch, %ux%u, %.2fM MAC) %7.1f MMAC/s  [%.1f%% of MACs]\n",
+                g_bench_conv1_ms, CONV0_OUT_CH, CONV1_OUT_CH, s2_w, s2_h,
+                c1_macs / 1e6f, c1_macs / 1e3f / g_bench_conv1_ms, 100.0f * c1_macs / tot_macs);
+  Serial.printf("  conv2    %7.2f ms  (%d->%dch, %ux%u, %.2fM MAC) %7.1f MMAC/s  [%.1f%% of MACs]\n",
+                g_bench_conv2_ms, CONV1_OUT_CH, CONV2_OUT_CH, s4_w, s4_h,
+                c2_macs / 1e6f, c2_macs / 1e3f / g_bench_conv2_ms, 100.0f * c2_macs / tot_macs);
+  Serial.printf("  conv3    %7.2f ms  (%d->%dch, %ux%u, %.2fM MAC) %7.1f MMAC/s  [%.1f%% of MACs]\n",
+                g_bench_conv3_ms, CONV2_OUT_CH, MODEL_FINAL_CHANNELS, s4_w, s4_h,
+                c3_macs / 1e6f, c3_macs / 1e3f / g_bench_conv3_ms, 100.0f * c3_macs / tot_macs);
   Serial.printf("  pool     %.2f ms\n", g_bench_pool_ms);
   Serial.printf("  dense    %.2f ms\n", g_bench_output_ms);
   Serial.printf("  TOTAL    %.2f ms  -> %.2f inferences/sec (inference only)\n", g_bench_total_ms,
@@ -1685,8 +1979,8 @@ static void run_inference_benchmark() {
   // only 3 input channels, 27-term inner loop, output in PSRAM), not a
   // compute result -- which is exactly the number this comparison wants.
   if (g_bench_total_ms > 0.0f) {
-    Serial.printf("  conv0 share: %.1f%% of inference time vs ~11%% of MACs\n\n",
-                  100.0f * g_bench_conv0_ms / g_bench_total_ms);
+    Serial.printf("  conv0 share: %.1f%% of inference time vs %.1f%% of MACs\n\n",
+                  100.0f * g_bench_conv0_ms / g_bench_total_ms), 100.0f * c0_macs / tot_macs;
   }
 }
 
@@ -1695,12 +1989,19 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
+  g_reset_reason = reset_reason_name(esp_reset_reason());
+  Serial.printf("reset reason: %s\n", g_reset_reason);
+
   if (!init_camera()) {
     Serial.println("Camera init failed, halting.");
     while (true) delay(1000);
   }
 
+#ifdef SOFTAP
+  start_softap();
+#else
   connect_wifi();
+#endif
 
   if (MDNS.begin(MDNS_HOSTNAME)) {
     MDNS.addService("http", "tcp", 80);
@@ -1735,9 +2036,22 @@ void setup() {
 }
 
 void loop() {
+#ifdef SOFTAP
+  // An AP has no association to lose, so there is nothing to reconnect. Report
+  // the client count instead, once a second, since "is anything joined?" is the
+  // equivalent question -- and a client that silently dropped off is otherwise
+  // indistinguishable from one that is simply not looking at the page.
+  static int last_clients = -1;
+  int clients = WiFi.softAPgetStationNum();
+  if (clients != last_clients) {
+    Serial.printf("SoftAP clients: %d\n", clients);
+    last_clients = clients;
+  }
+#else
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi disconnected, reconnecting...");
     connect_wifi();
   }
+#endif
   delay(1000);
 }

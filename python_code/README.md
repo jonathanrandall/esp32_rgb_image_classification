@@ -115,27 +115,32 @@ Writes to `output/<artifacts-name>/`: `float_model.pt`, `qat_model.pt`,
 
 ### What the shipped weights were built with
 
-`model_manifest.json` now records the full invocation, so this is recovered
-from the artifacts rather than remembered:
+`model_manifest.json` records the full invocation, so this is recovered from the
+artifacts rather than remembered:
 
 ```
---rgb-block-width 5 --rgb-block-height 5 --classes people,computer,doors,fruit,car,furniture,garden --use-augmentation
+--rgb-block-width 5 --rgb-block-height 5 --classes people,computer,doors,fruit,car --use-augmentation --conv-channels 32,32,64
 ```
 
 | | |
 |---|---|
-| classes | people, computer, doors, fruit, car, furniture, garden |
+| classes | people, computer, doors, fruit, car |
 | reduction | 5x5 block mean -> 32x24 |
-| architecture | conv 16,32,64 + extra 32 |
+| architecture | conv 32,32,64 + extra 32 |
 | epochs | 60 float, 20 QAT |
 | augmentation | on |
 | seed | 1234 |
-| int8 test | 73.2% |
+| int8 test | 81.3% |
+
+Note the first conv stage is **32** channels here, not the `16,32,64` default —
+widening it was worth ~2 points. All four layers stay well under the ESP-NN
+filter-cache cliff (`out_ch * in_ch` below ~3,600, the largest here being 2,048),
+which is the constraint that matters on device rather than parameter count.
 
 `--classes` sets the model's class index order, and that order is baked into
-`MODEL_CLASS_NAMES` in the exported header — reorder the flag and the
-firmware's labels silently stop matching its logits. `--fine-tune-from`
-refuses to proceed across a mismatch for exactly this reason.
+`MODEL_CLASS_NAMES` in the exported header — reorder the flag and the firmware's
+labels silently stop matching its logits. `--fine-tune-from` refuses to proceed
+across a mismatch for exactly this reason.
 
 **On reproducibility.** `--seed` seeds Python, NumPy and Torch, but
 `torch.use_deterministic_algorithms` is *not* set, so cuDNN's nondeterministic

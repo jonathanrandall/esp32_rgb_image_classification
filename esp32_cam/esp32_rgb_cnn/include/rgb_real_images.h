@@ -171,9 +171,9 @@ static const uint8_t REAL_IMAGE_COMPUTER[3][24][32] = {
 
 #define REAL_NUM_VECTORS 2
 static const uint8_t *const REAL_IMAGES[REAL_NUM_VECTORS] = { (const uint8_t *)REAL_IMAGE_PEOPLE, (const uint8_t *)REAL_IMAGE_COMPUTER };
-static const int8_t REAL_EXPECTED_LOGITS[REAL_NUM_VECTORS][7] = {
-    {   16,  -27,  -53,   -4,   -7,   11,  -44 },  /* people */
-    {   -5,   29,  -56,  -26,   16,   10,  -43 }  /* computer */
+static const int8_t REAL_EXPECTED_LOGITS[REAL_NUM_VECTORS][5] = {
+    {   52,  -32,  -46,  -18,  -12 },  /* people */
+    {  -10,   35,  -62,  -37,    5 }  /* computer */
 };
 static const uint8_t REAL_EXPECTED_CLASS[REAL_NUM_VECTORS] = { 0, 1 };
 static const char *const REAL_CLASS_NAMES[REAL_NUM_VECTORS] = { "people", "computer" };

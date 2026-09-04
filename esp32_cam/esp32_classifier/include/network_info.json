@@ -1,0 +1,41 @@
+{
+  "format_version": 1,
+  "capture_width": 160,
+  "capture_height": 120,
+  "chroma_subsampling": "4:2:2",
+  "y_rows": 15,
+  "y_cols": 20,
+  "c_rows": 15,
+  "c_cols": 10,
+  "num_ac_coeffs": 3,
+  "num_coeffs": 4,
+  "num_chroma_ac_coeffs": 0,
+  "num_chroma_coeffs": 1,
+  "coefficient_order": "zigzag",
+  "use_chroma": true,
+  "lum_channels": 16,
+  "stride2_channels": 32,
+  "post_concat_channels": 64,
+  "extra_conv_channels": [
+    32
+  ],
+  "num_classes": 5,
+  "class_names": [
+    "people",
+    "computer",
+    "doors",
+    "fruit",
+    "car"
+  ],
+  "act_scale_lum": 0.05827514393123116,
+  "act_scale_stride2": 0.10270075910673367,
+  "act_scale_postconcat": 0.05890706580454909,
+  "output_scale": 0.04765004060399814,
+  "float_test_accuracy": 0.7699421965317919,
+  "qat_test_accuracy": 0.7884393063583816,
+  "int8_reference_test_accuracy": 0.7872832369942196,
+  "int8_vs_qat_agreement": 0.9872832369942196,
+  "cpu_inference_ms": 0.4034353499991994,
+  "architecture": "cnn",
+  "weights_header": "model_weights.h"
+}

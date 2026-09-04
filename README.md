@@ -12,9 +12,23 @@ Five classes: `people`, `computer`, `doors`, `fruit`, `car`.
 firmware — is what produced the weights in
 `esp32_cam/esp32_rgb_cnn/include/model_weights.h`.
 
-> This is the pixel-domain half of a comparison. The compressed-domain half —
-> classifying JPEG DCT coefficients directly, skipping the decode — lives in
-> [esp32_dct_jpg_image_classification](https://github.com/jonathanrandall/esp32_dct_jpg_image_classification).
+### Both arms are here
+
+This is one half of a comparison, and the other half is in this repository too.
+
+| arm | reads | firmware | training script |
+|---|---|---|---|
+| **pixel domain** | RGB565 → 5×5 block means | `esp32_cam/esp32_rgb_cnn/` | `train_rgb_cnn.py` |
+| **compressed domain** | JPEG DCT coefficients, no decode | `esp32_cam/esp32_classifier/` | `train_cnn.py` |
+
+The compressed-domain arm never reconstructs pixels: the OV2640 encodes JPEG in
+hardware, so the DCT coefficients already exist in the bitstream and the model
+reads them directly. The pixel arm exists to measure what that is worth on
+matched data and a matched architecture.
+
+An 8×8 block mean *is* the DCT DC coefficient (the orthonormal DCT-II divides by
+`sqrt(N)` per axis, so `DC = 8 × mean`), which is what makes block-mean RGB the
+honest equal-resolution control rather than an arbitrary downsampler.
 
 ---
 
@@ -144,6 +158,39 @@ The serial log prints the board's IP. Open it in a browser.
 verdict, a `byte_order` block that measures the RGB565 byte order both ways,
 and a `buffers` report of where every activation buffer was allocated.
 
+### Streaming reliability
+
+Two symptoms that looked unrelated — the preview stalling for a second or
+more, and the board occasionally resetting — turned out to be one fault, and
+the reset was the stall escalating.
+
+A stalled Wi-Fi send blocks the stream loop, so frame buffers stop being
+returned. The camera driver runs out and logs an overflow from `cam_task`.
+That log call reaches newlib's `vprintf`, which allocates a mutex, and
+overflows `cam_task`'s stack: **reporting the problem is what killed the
+board.** Silencing the driver's tags before `esp_camera_init()` fixes it —
+
+```c
+esp_log_level_set("cam_hal",   ESP_LOG_NONE);
+esp_log_level_set("s3 ll_cam", ESP_LOG_NONE);
+esp_log_level_set("camera",    ESP_LOG_NONE);
+```
+
+— and also removes a stall *amplifier*, because each of those lines blocked
+~2.6 ms on UART0 per dropped frame, preventing the DMA from being serviced and
+causing more drops.
+
+Two smaller fixes sit alongside it: `GET /claim` on port 80 lets a new viewer
+evict a stale-but-open socket that owns the single stream slot (port 81 is
+inside its handler and cannot hear anything, which is also why
+`lru_purge_enable` does not help), and the page's watchdog now recognises
+`last_frame_age_ms == -1` — "no frame since boot" is the *absence* of an age,
+so an `age > 8000` test could never catch a post-reset stall.
+
+What none of this fixes is the radio. Full write-up, including the decoded
+backtrace and the link measurements:
+[`stream_stall_issue.md`](stream_stall_issue.md).
+
 ### ESP-NN
 
 Enabled by two flags in `platformio.ini`:
@@ -206,6 +253,97 @@ and flashes. Doing it by hand is easy to get wrong: the exporter writes
 `model_weights.h`, but the **verifier** writes the two self-test vector headers,
 one directory up — copy only the first and the boot self-test compares a new
 model against another model's expected logits.
+
+The compressed-domain arm is the same shape, with its own exporter and
+verifier:
+
+```bash
+python train_cnn.py \
+    --capture-width 160 --capture-height 120 --chroma-subsampling 4:2:2 \
+    --num-ac-coeffs 2 --num-chroma-ac-coeffs 0 \
+    --classes people,computer,doors,fruit,car --use-augmentation
+
+python export_cnn_c_weights.py cnn     # -> output/cnn/model_weights.h
+python verify_cnn_c_export.py cnn      # expect 25/25 bit-exact
+```
+
+Then copy `output/cnn/{model_weights.h,test_vectors.h}` into
+`esp32_cam/esp32_classifier/include/` and set `DCT_NUM_AC_COEFFS` in
+`src/dct_features.h` to match — a `static_assert` in `main.cpp` fails the build
+if they disagree.
+
+---
+
+## CLI reference — the two training scripts
+
+Every option, with its real default taken from the argparse definitions.
+Anything with a blank default is required only in the sense that the script
+supplies its own; `None` means "computed at runtime", explained in the notes.
+
+### `train_cnn.py` — compressed domain (JPEG DCT coefficients)
+
+| option | type | default | what it does |
+|---|---|---|---|
+| `--capture-width` | int | `160` | Build resolution of `data/`. Must be a multiple of 16. |
+| `--capture-height` | int | `120` | Multiple of 16 under 4:2:0, multiple of 8 under 4:2:2. |
+| `--chroma-subsampling` | `4:2:0` \| `4:2:2` | `4:2:2` | Matches what the OV2640 actually emits. `4:2:0` is the project's original assumption, kept only so older 96×96 configs still reproduce. |
+| `--dataset-source` | str | `everyday_openimages160x120` | Source directory (relative to the project root) that `data/` is built from. |
+| `--num-ac-coeffs` | int | `3` | Luma AC coefficients kept per 8×8 block **on top of** DC. `0` = DC-only. See the warning below before raising it. |
+| `--num-chroma-ac-coeffs` | int | `None` → matches `--num-ac-coeffs` | Chroma AC count, independent of luma. **Set this to `0` on OV2640 hardware** (see below). |
+| `--classes` | csv | `None` → all classes | Subset of class names, e.g. `people,computer,doors,fruit,car`. |
+| `--epochs` | int | `60` | Float-training epochs. Early stopping patience is 12. |
+| `--qat-epochs` | int | `20` | Quantization-aware fine-tuning epochs after float training. |
+| `--dropout` | float | `0.3` | Dropout before the classifier head. |
+| `--no-chroma` | flag | off | Drop Cb/Cr fusion entirely (luma-only ablation). |
+| `--lum-channels` | int | `16` | `lum_conv` output channels. |
+| `--stride2-channels` | int | `32` | `stride2_conv` output channels. |
+| `--post-concat-channels` | int | `64` | `post_concat_conv` output channels. |
+| `--extra-conv-channels` | csv | `32` | Extra conv stages after the concat, e.g. `64,64`. Empty string for none. |
+| `--coeff-scan-order` | `zigzag` \| `axis_first` | `zigzag` | Which positions in the 8×8 block the kept coefficients come from: JPEG zig-zag, or pure horizontal/vertical frequencies first. |
+| `--use-augmentation` | flag | off | **Offline** augmentation: each train image is decoded, augmented, and re-encoded to a real JPEG before coefficients are extracted — necessary because this arm reads coefficients from the bitstream rather than computing them. Val/test never augmented. |
+| `--augment-copies` | int | `1` | Augmented variants per train image when `--use-augmentation` is on. |
+| `--seed` | int | `1234` | Seeds Python/NumPy/Torch. Note `torch.use_deterministic_algorithms` is **not** set, so cuDNN still gives ~0.5–1.4 points of run-to-run variation. |
+
+Output always goes to `output/cnn/` — this script has no `--artifacts-name`.
+
+> **Coefficient budget: more is not better on real hardware.** Higher AC counts
+> score *better* on the test split and *worse* on the camera, because the extra
+> planes are ~93% zeros on this sensor. Chroma AC is effectively dead on the
+> OV2640: coefficient 1 is nonzero in 7.2% of camera blocks against 66.5% in
+> training, and coefficient 3 in none at all. Keep `--num-chroma-ac-coeffs 0`
+> for anything you intend to deploy. Full measurements in
+> [`python_code/README.md`](python_code/README.md).
+
+### `train_rgb_cnn.py` — pixel domain (RGB block means)
+
+| option | type | default | what it does |
+|---|---|---|---|
+| `--capture-width` | int | `160` | Build resolution of `data/`, multiple of 16. |
+| `--capture-height` | int | `120` | Build resolution of `data/`. |
+| `--chroma-subsampling` | `4:2:0` \| `4:2:2` | `4:2:2` | Only affects the `data/` build/reuse check — irrelevant to this model's own RGB decode. |
+| `--dataset-source` | str | `everyday_openimages160x120` | As `train_cnn.py`. |
+| `--rgb-block-width` | int | `8` | Average this many pixels horizontally into one input value. `8` makes it the exact equal-resolution control for the DCT arm (an 8×8 block mean *is* the DC coefficient); `5` is what this project ships; `1` is full resolution. |
+| `--rgb-block-height` | int | `8` | As above, vertically. |
+| `--downsample-factor` | int | `1` | Resize decoded pixels down by this factor *before* block averaging. `1` = full capture resolution. |
+| `--classes` | csv | `None` → all classes | Subset of class names. |
+| `--conv-channels` | csv | `16,32,64` | Main conv stack. First stage is stride 1; every later stage is stride 2. The shipped model uses `32,32,64`. |
+| `--extra-conv-channels` | csv | `32` | Extra stride-1 stages after the main stack. Empty string for none. |
+| `--dropout` | float | `0.3` | Dropout before the classifier head. |
+| `--epochs` | int | `60` | Float-training epochs. |
+| `--qat-epochs` | int | `20` | QAT epochs. |
+| `--artifacts-name` | str | `rgb_cnn` | Subdirectory of `output/` to write to. Change it to avoid overwriting a trained model. |
+| `--data-dir` | str | `data` | Dataset to train on. Point at `data_hand_curated` for fine-tuning. **Any value other than `data` skips `ensure_dataset()`**, so a hand-built directory is never silently regenerated. |
+| `--test-data-dir` | str | `None` → `--data-dir` if it has `test/`, else `data` | Where the test split comes from. Fine-tuning sets deliberately have no `test/`, so base and fine-tuned models are scored on the same untouched split. |
+| `--fine-tune-from` | str | `None` | `output/` subdirectory to initialise from, e.g. `rgb_cnn`. Loads its `float_model.pt` and **refuses to run** if the manifest's architecture, block reduction, or class list/order disagree with this run. |
+| `--fine-tune-lr` | float | `1e-4` | Learning rate used with `--fine-tune-from`, ~10× below the from-scratch rate. QAT afterwards still uses its own rate. |
+| `--use-augmentation` | flag | off | **Live** augmentation, applied fresh to decoded pixels every epoch — no JPEG re-encode needed here, unlike the DCT arm, so the augmentation varies per epoch rather than being fixed at extraction time. Val/test never augmented. |
+| `--seed` | int | `1234` | As `train_cnn.py`, same cuDNN caveat. |
+
+Shared between both: `--epochs`, `--qat-epochs`, `--dropout`, `--seed`,
+`--classes`, `--capture-*`, `--chroma-subsampling`, `--dataset-source` and
+`--extra-conv-channels` mean the same thing in each. The differences that
+matter are that only `train_rgb_cnn.py` has fine-tuning and `--artifacts-name`,
+and only `train_cnn.py` has the coefficient options.
 
 ### Hand curation and fine-tuning
 
@@ -275,7 +413,25 @@ esp32_cam/esp32_rgb_cnn/     PlatformIO firmware
   speed_up.md                  what made inference fast, and where the headroom still is
   network_info.json            the shipped model's manifest
 
-python_code/                 training, export, verification
+esp32_cam/esp32_classifier/  PlatformIO firmware -- the compressed-domain arm
+  src/main.cpp                 capture, DCT extraction, inference, HTTP, streaming
+  src/dct_features.{h,cpp}     the JPEG parser: pulls DCT coefficients from the
+                               bitstream without ever reconstructing pixels.
+                               DCT_NUM_AC_COEFFS here must match the model --
+                               a static_assert in main.cpp enforces it.
+  include/model_weights.h      generated: int8 weights + model_forward()
+  include/test_vectors.h       generated: 25 vectors + expected logits
+  include/real_test_jpegs.h    generated: 3 real camera JPEGs + expected planes,
+                               a decoder check independent of the model
+  scratchpad/                  gen_real_test_header.cpp regenerates the above
+  lib/esp_nn/                  vendored from espressif/esp-nn
+
+python_code/                 training, export, verification -- both arms
+  train_rgb_cnn.py             pixel domain
+  train_cnn.py                 compressed domain
+  export_to_firmware.py        export -> verify -> back up -> install -> flash (RGB)
+  export_cnn_c_weights.py      \  the DCT arm's export/verify pair, run by hand
+  verify_cnn_c_export.py       /
   dct_common/                  shared library (feature extraction, QAT, quantization)
 
 data_curation/               how the raw pull was selected and filtered

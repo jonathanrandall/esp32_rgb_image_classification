@@ -138,7 +138,7 @@ static httpd_handle_t stream_httpd = NULL;
 // implausibly small ~1.3KB for 160x120. Kept as two separately named constants
 // so the confusion cannot recur.
 #define SENSOR_JPEG_QUALITY 12   // 12 0-63, lower = better (sensor hardware encoder)
-#define JPEG_ENCODE_QUALITY 20   // 1-100, higher = better (jpge software encoder) 80
+#define JPEG_ENCODE_QUALITY 50   // 1-100, higher = better (jpge software encoder) 80
 
 // Runtime-settable via /config?jq=N so quality/bandwidth/encode-time can be
 // swept without a reflash -- encode time is one of the measured pipeline

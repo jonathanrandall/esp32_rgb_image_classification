@@ -1,0 +1,38 @@
+# Python dependencies for python_code/.
+#
+#   pip install -r requirements.txt
+#
+# Tested on Python 3.12 with the versions in the trailing comments. The
+# floors below are deliberately loose -- nothing here uses a recent-only
+# API -- so a newer release should be fine.
+#
+# Nothing outside this repository is needed beyond these: the dataset is
+# downloaded by get_everyday_openimages_data.py and the YOLO weights are
+# fetched automatically by ultralytics on first use.
+
+# ---------------------------------------------------------------------------
+# Training and export -- needed for every workflow
+# ---------------------------------------------------------------------------
+
+# For a CUDA build, install torch FIRST from the official index, otherwise
+# pip resolves the CPU wheel and training falls back to CPU:
+#     pip install torch --index-url https://download.pytorch.org/whl/cu126
+torch>=2.0                  # tested 2.13.0+cu126
+numpy>=1.24                 # tested 2.5.1
+tqdm>=4.65                  # tested 4.70.0
+pillow>=10.0                # tested 12.3.0
+
+# Reads quantized DCT coefficients straight from the JPEG bitstream, which
+# is what the compressed-domain arm trains on. Also used by the dataset
+# builder to check a JPEG's real chroma block grid, so it is required even
+# for the pixel-domain arm.
+jpeglib>=1.0                # tested 1.0.2
+
+# ---------------------------------------------------------------------------
+# Dataset construction -- only for steps 1 and 2 (both heavy)
+# ---------------------------------------------------------------------------
+# Skip these two if you already have a built data/ directory. fiftyone
+# pulls in a bundled MongoDB, and ultralytics pulls its own torch stack.
+
+fiftyone>=1.0               # tested 1.20.1  -- get_everyday_openimages_data.py
+ultralytics>=8.0            # tested 8.4.120 -- detect_people_yolo.py (YOLO11m)

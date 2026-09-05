@@ -392,11 +392,71 @@ Shared between both: `--epochs`, `--qat-epochs`, `--dropout`, `--seed`,
 matter are that only `train_rgb_cnn.py` has fine-tuning and `--artifacts-name`,
 and only `train_cnn.py` has the coefficient options.
 
+### Filtering: three independent passes
+
+Before training, the dataset build can drop images three different ways. They
+are **separate flags and none implies another** — worth knowing, because only
+the third involves anything not in this repository.
+
+| pass | flag to disable | what it drops | needs anything not in this repo? |
+|---|---|---|---|
+| **intersections** | `--no-filter` | images whose Open Images annotations list another target class — a person annotated in a `car` photo, a chair in a `table` photo | **no** — the metadata is written by `get_everyday_openimages_data.py` |
+| **YOLO people** | `--no-yolo-filter` | images where a YOLO11m pass detects a person at ≥0.25 confidence, in every class except `people`. Catches people Open Images never annotated | **no** — written by `detect_people_yolo.py`; `ultralytics` fetches the weights |
+| **hand curation** | `--no-curation-filter` | filenames listed in `meta/{split}_curation_rejects.json` — images judged bad by eye | **no**, but the *list* is not shipped; see below |
+
+The first two are fully automatic and reproduce from a clean clone. Run them
+and train, and nothing else is required.
+
+**The hand-curation reject lists are deliberately not in this repository.**
+They are one person's judgements about ~193 specific Open Images files, and
+they are meaningless without the image set those filenames refer to — which
+is also not shipped, because it is far too large. Their absence is handled,
+not an error: `load_curation_rejects()` treats a missing file as *"nothing
+hand-rejected yet"*, so `build_data.py` runs normally with that pass a no-op.
+`curation_resolve.py` **creates** the file the first time you reject anything,
+so the workflow below works from an empty start and accumulates your own
+judgements rather than inheriting someone else's.
+
+One honest consequence: a dataset built from a clean clone contains ~112 more
+images (across the five deployed classes) than the one that produced the
+shipped weights, so retraining reproduces them only to within the run-to-run
+noise floor, not exactly. That difference is smaller than the noise floor
+itself — see the reproducibility caveat below.
+
+### Using your own classes
+
+Nothing here is tied to the five classes this project ships. To pick your own:
+
+1. Edit `CLASS_MAP` in `get_everyday_openimages_data.py` — the Open Images
+   V7 class names to pull, and how many per class (`TRAIN_PER_CLASS`,
+   default 1000).
+2. Edit `CLASS_MERGE_MAP` and `CLASS_DROP` in `build_data.py` if you want
+   several source classes combined into one label (this project merges
+   `laptop + keyboard + monitor → computer`) or dropped entirely. Both are
+   edit-the-script config rather than CLI flags, deliberately — they are
+   dataset definitions, not per-run options.
+3. Run the pipeline. `build_data.py` writes the resolved class list to
+   `dct_common/class_names.json`, which every training script reads, so the
+   taxonomy stays in sync automatically.
+4. Pass the subset you want to train on with `--classes`.
+
+The full path, with no dependency on anything outside this repository beyond
+pip packages (`fiftyone`, `ultralytics`, `torch`, `jpeglib`, `numpy`, `tqdm`):
+
+```bash
+cd python_code
+python get_everyday_openimages_data.py   # pull from Open Images V7 via FiftyOne
+python detect_people_yolo.py             # YOLO11m person pass over the saved pixels
+python build_data.py                     # merge + filter + build data/{train,val,test}
+python train_rgb_cnn.py --classes <your,classes> --use-augmentation
+```
+
 ### Hand curation and fine-tuning
 
-Train the base model on all of `data/` untouched, then hand-curate a subset and
-fine-tune on it. Batch pull, a single review page with a folder dropdown, and a
-reject record that survives a `build_data.py` rebuild:
+Optional, and independent of the two automatic filters above. Train the base
+model on all of `data/` untouched, then hand-curate a subset and fine-tune on
+it. Batch pull, a single review page with a folder dropdown, and a reject
+record that survives a `build_data.py` rebuild:
 
 ```bash
 python python_code/curation_pull.py          # pull a batch to review

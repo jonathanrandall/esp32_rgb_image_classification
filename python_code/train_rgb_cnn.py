@@ -90,15 +90,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-source", type=str, default="everyday_openimages160x120",
                          help="source directory name (relative to the project root) to build data/ from -- "
                               "see train_cnn.py's --dataset-source help for the full list of options")
-    parser.add_argument("--rgb-block-width", type=int, default=8,
+    parser.add_argument("--rgb-block-width", type=int, default=5,
                         help="average each block of this many pixels horizontally into one "
-                             "input value (default: 8). An 8x8 block mean is exactly the DCT "
-                             "arm's DC coefficient, so the default makes this the "
-                             "equal-resolution pixel control -- 20x15 at 160x120 capture. "
-                             "Use 1 (with --rgb-block-height 1) for full-resolution pixels, "
-                             "which is what the paper's RGB arm used.")
-    parser.add_argument("--rgb-block-height", type=int, default=8,
-                        help="as --rgb-block-width, vertically (default: 8)")
+                             "input value (default: 5). 5x5 gives a 32x24 grid at 160x120 "
+                             "capture and is the operating point this project ships -- it "
+                             "matched 4x4 on accuracy while carrying 56%% less data, and 8x8 "
+                             "gives up ~3 points. Use 8 for the equal-resolution DCT control "
+                             "(an 8x8 block mean is exactly the DC coefficient, giving a 20x15 "
+                             "grid); use 1 with --rgb-block-height 1 for full-resolution pixels.")
+    parser.add_argument("--rgb-block-height", type=int, default=5,
+                        help="as --rgb-block-width, vertically (default: 5)")
     parser.add_argument("--artifacts-name", type=str, default="rgb_cnn",
                         help="subdirectory of output/ to write to (default: rgb_cnn). Use a "
                              "different name to avoid overwriting an existing trained model.")

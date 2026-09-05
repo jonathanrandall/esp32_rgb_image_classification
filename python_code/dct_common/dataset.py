@@ -46,21 +46,37 @@ def make_capture_resolution_jpeg(src_image: Image.Image, dst_path: Path, cfg: Co
 
 
 def dataset_matches_config(data_dir: Path, cfg: Config) -> bool:
-    """True if data/{train,val,test} exist, have the current CLASS_NAMES as
-    subfolders (catches a stale build from a different dataset -- e.g. a
-    leftover Caltech-256 build lying around after switching datasets),
-    those JPEGs are already sized cfg.capture_width x cfg.capture_height,
-    AND their actual chroma block grid matches cfg.c_rows x cfg.c_cols --
-    this last check is what catches a data/ built under a different
-    chroma_subsampling (e.g. 4:2:0 vs 4:2:2) at the *same* pixel
-    resolution, which the size check alone can't see (see issues.md's
-    camera chroma-subsampling mismatch for why this distinction matters)."""
+    """True if data/{train,val,test} exist, CONTAIN the classes this run
+    actually needs, those JPEGs are already sized cfg.capture_width x
+    cfg.capture_height, AND their actual chroma block grid matches
+    cfg.c_rows x cfg.c_cols -- this last check is what catches a data/
+    built under a different chroma_subsampling (e.g. 4:2:0 vs 4:2:2) at the
+    *same* pixel resolution, which the size check alone can't see (see
+    issues.md's camera chroma-subsampling mismatch for why this distinction
+    matters).
+
+    CLASS CHECK IS A SUBSET TEST AGAINST cfg.active_class_names, NOT
+    EQUALITY AGAINST CLASS_NAMES. It used to require data/ to hold exactly
+    the full CLASS_NAMES list, which asked the wrong question twice:
+
+      - Training a 5-class subset (`--classes people,computer,...`) against
+        a data/ containing only those 5 was reported as a MISMATCH, even
+        though every class the run needs is present. The "fix" was a
+        rebuild -- and a rebuild deletes data/ (see
+        build_openimages_dataset) before it can fail.
+      - It ignored --classes entirely, so the decision to destroy and
+        rebuild was driven by classes the run was never going to touch.
+
+    Extra classes in data/ are harmless: build_spatial_split only reads
+    cfg.active_class_names. What matters is that nothing needed is missing,
+    which is exactly what a subset test asks."""
+    required = set(cfg.active_class_names)
     for split in ("train", "val", "test"):
         split_dir = data_dir / split
         if not split_dir.exists():
             return False
         class_dirs = {p.name for p in split_dir.iterdir() if p.is_dir()}
-        if class_dirs != set(CLASS_NAMES):
+        if not required <= class_dirs:
             return False
         jpgs = list(split_dir.rglob("*.jpg"))
         if not jpgs:
@@ -221,5 +237,30 @@ def ensure_dataset(data_dir: Path, cfg: Config, source_dir: Path | None = None) 
     try:
         build_openimages_dataset(data_dir, cfg, source_dir=source_dir)
     except Exception as exc:
-        print(f"  openimages_8class build failed ({exc!r}), falling back to synthetic placeholder dataset.")
-        generate_synthetic_dataset(data_dir, cfg)
+        # DO NOT fall back to generate_synthetic_dataset() here. It used to,
+        # and the failure was silent and expensive:
+        #
+        #   1. build_openimages_dataset() rmtree's data/ BEFORE it can fail,
+        #      so the real dataset is already gone by this point.
+        #   2. The fallback refilled data/ with random-noise images carrying
+        #      a per-class brightness bias.
+        #   3. Training then ran to completion and printed a plausible
+        #      accuracy table computed entirely on noise.
+        #
+        # The only signal was one line of console output. Worse, the rebuild
+        # CANNOT succeed for the current taxonomy: data/'s merged classes
+        # (computer, furniture, crockery) exist only as build_data.py's
+        # output, never in the raw --dataset-source, so discovery always
+        # raises. That makes this path purely destructive.
+        raise SystemExit(
+            f"\nRebuilding {data_dir} from {source_dir} FAILED:\n"
+            f"  {exc}\n\n"
+            f"{data_dir} has already been deleted -- that happens before the failure.\n\n"
+            f"Rebuild it with build_data.py, which is the only thing that can produce it\n"
+            f"(it merges source classes into the taxonomy in dct_common/class_names.json,\n"
+            f"e.g. laptop+keyboard+monitor -> computer; those merged names do not exist in\n"
+            f"the raw source directory):\n\n"
+            f"    cd python_code && python build_data.py\n\n"
+            f"Anything you added to {data_dir} by hand is gone -- board captures live in\n"
+            f"board_captures/ and must be re-copied after the rebuild.\n"
+        ) from exc

@@ -50,7 +50,7 @@ For your own classes, edit `CLASS_MAP` in
 
 ```bash
 python train_rgb_cnn.py \
-    --classes people,computer,doors,fruit,car \
+    --classes people,computer,doors,fruit,car,garden \
     --conv-channels 32,32,64 \
     --use-augmentation
 ```

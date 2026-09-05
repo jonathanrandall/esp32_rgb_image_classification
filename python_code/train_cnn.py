@@ -15,6 +15,7 @@ accuracy table.
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -379,6 +380,26 @@ def main() -> None:
         "int8_reference_test_accuracy": int8_test_accuracy,
         "int8_vs_qat_agreement": agreement,
         "cpu_inference_ms": cpu_timing["ms_per_inference"],
+        # Provenance, mirroring train_rgb_cnn.py's manifest. Recorded because
+        # the fields above describe the MODEL but not the RUN, and that gap has
+        # already cost real time: with a trained model in hand there was no way
+        # to tell whether it had been trained with --use-augmentation, which
+        # turned out to be worth ~1.2 points and made two runs look
+        # incomparable when they were not.
+        #
+        # argv is the whole invocation, so nothing here has to be kept in sync
+        # by hand as flags are added. It is not sufficient on its own, though:
+        # it records only what was PASSED, so a flag left at its default is
+        # invisible, and defaults do change (--rgb-block-width went 8 -> 5 on
+        # 2026-09-05). Hence the resolved values alongside it.
+        "data_dir": args.data_dir,
+        "epochs": cfg.epochs,
+        "qat_epochs": args.qat_epochs,
+        "use_augmentation": args.use_augmentation,
+        "augment_copies": args.augment_copies,
+        "dataset_source": args.dataset_source,
+        "seed": cfg.seed,
+        "argv": sys.argv,
     }
     with open(ARTIFACTS_DIR / "model_manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)

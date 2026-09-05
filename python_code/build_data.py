@@ -110,7 +110,20 @@ CLASS_MERGE_MAP = {
     # their own classes (build_data.py's default for anything neither merged
     # nor dropped), so they stay available and can be excluded at training
     # time with --classes rather than by another rebuild.
-    "furniture": ["table", "chair", "couch"],
+    # 2026-09-05: `table` split out of `furniture`, leaving chair+couch.
+    # Same reasoning as the bookshelves/cutlery split above, one step
+    # further. Adding `furniture` to the 5-class model cost 9 points (DCT
+    # 80.1% -> 71.3%, RGB 80.5% -> 69.5%) and `furniture` was the weakest
+    # class in both arms, which is the signature of a label spanning
+    # several visual concepts. A table is a flat horizontal plane; a chair
+    # and a couch are seat-shaped and share silhouette and context. At a
+    # 15x20 (DCT) or 32x24 (RGB) grid, asking one label to cover all three
+    # is asking for a boundary the model cannot draw.
+    #
+    # `table` is NOT dropped -- it passes through as its own class, so the
+    # images stay available and can be excluded at training time with
+    # --classes rather than needing another rebuild.
+    "furniture": ["chair", "couch"],
     "computer": ["laptop", "keyboard", "monitor"],
     "crockery": ["bowls", "plates", "cups"],
 }

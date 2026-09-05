@@ -58,7 +58,7 @@ python train_cnn.py \
     --capture-width 160 --capture-height 120 --chroma-subsampling 4:2:2 \
     --num-ac-coeffs 3 --num-chroma-ac-coeffs 0 \
     --extra-conv-channels 32 \
-    --classes people,computer,doors,fruit,car \
+    --classes people,computer,doors,fruit,car,garden \
     --use-augmentation
 ```
 

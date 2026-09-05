@@ -5,9 +5,9 @@ domain**: the camera is read as raw RGB565, reduced to a 32x24 grid by
 averaging 5x5 blocks of pixels, and classified by a small int8 CNN running
 under [ESP-NN](https://github.com/espressif/esp-nn).
 
-Five classes: `people`, `computer`, `doors`, `fruit`, `car`.
+Six classes: `people`, `computer`, `doors`, `fruit`, `car`, `garden`.
 
-**81.3% int8 test accuracy on 2,304 input values per frame**, 78.9% balanced. Everything here
+**83.0% int8 test accuracy on 2,304 input values per frame**, 82.3% balanced. Everything here
 — training, quantization, C export, bit-exactness verification, and the
 firmware — is what produced the weights in
 `esp32_cam/esp32_rgb_cnn/include/model_weights.h`.
@@ -80,12 +80,15 @@ shipped weights:
 
 | split | float | QAT | int8 |
 |---|---:|---:|---:|
-| train | 83.4% | 85.3% | 86.5% |
-| val | 82.0% | 82.5% | 82.2% |
-| test | 80.2% | 81.3% | **81.3%** |
+| train | 84.2% | 86.8% | 88.5% |
+| val | 84.3% | 85.9% | 85.5% |
+| test | 81.3% | 82.9% | **83.0%** |
 
 Balanced (macro-averaged per-class recall), which weights every class equally:
-**78.9%** on test.
+**82.3%** on test.
+
+The compressed-domain arm on the same six classes and the same data:
+**81.7%** int8, 80.2% balanced.
 
 int8-vs-QAT prediction agreement: **99.7%**. The int8 reference is bit-exact
 against the C export — see *Verification* below.
@@ -240,7 +243,7 @@ python build_data.py
 # 2. train: float -> QAT -> bit-exact int8
 python train_rgb_cnn.py \
     --rgb-block-width 5 --rgb-block-height 5 \
-    --classes people,computer,doors,fruit,car \
+    --classes people,computer,doors,fruit,car,garden \
     --conv-channels 32,32,64 --use-augmentation
 
 # 3. export C weights and verify them against the Python int8 reference
@@ -261,7 +264,7 @@ verifier:
 python train_cnn.py \
     --capture-width 160 --capture-height 120 --chroma-subsampling 4:2:2 \
     --num-ac-coeffs 2 --num-chroma-ac-coeffs 0 \
-    --classes people,computer,doors,fruit,car --use-augmentation
+    --classes people,computer,doors,fruit,car,garden --use-augmentation
 
 python export_cnn_c_weights.py cnn     # -> output/cnn/model_weights.h
 python verify_cnn_c_export.py cnn      # expect 25/25 bit-exact
@@ -337,7 +340,7 @@ supplies its own; `None` means "computed at runtime", explained in the notes.
 | `--dataset-source` | str | `everyday_openimages160x120` | Source directory (relative to the project root) that `data/` is built from. |
 | `--num-ac-coeffs` | int | `3` | Luma AC coefficients kept per 8×8 block **on top of** DC. `0` = DC-only. See the warning below before raising it. |
 | `--num-chroma-ac-coeffs` | int | `None` → matches `--num-ac-coeffs` | Chroma AC count, independent of luma. **Set this to `0` on OV2640 hardware** (see below). |
-| `--classes` | csv | `None` → all classes | Subset of class names, e.g. `people,computer,doors,fruit,car`. |
+| `--classes` | csv | `None` → all classes | Subset of class names, e.g. `people,computer,doors,fruit,car,garden`. |
 | `--epochs` | int | `60` | Float-training epochs. Early stopping patience is 12. |
 | `--qat-epochs` | int | `20` | Quantization-aware fine-tuning epochs after float training. |
 | `--dropout` | float | `0.3` | Dropout before the classifier head. |
@@ -425,7 +428,7 @@ itself — see the reproducibility caveat below.
 
 ### Using your own classes
 
-Nothing here is tied to the five classes this project ships. To pick your own:
+Nothing here is tied to the six classes this project ships. To pick your own:
 
 1. Edit `CLASS_MAP` in `get_everyday_openimages_data.py` — the Open Images
    V7 class names to pull, and how many per class (`TRAIN_PER_CLASS`,

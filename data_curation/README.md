@@ -1,4 +1,33 @@
-# Dataset curation workflow
+# Dataset curation workflow (superseded — historical)
+
+> **This describes the OLD workflow, on a dataset the project no longer
+> trains on. Do not follow it for new work.** It is kept because the
+> pull → review → resolve shape is still the shape of the current
+> workflow, and because `openimages_160x120/` still exists on disk.
+>
+> Four things in it are out of date:
+>
+> | this document says | actually now |
+> |---|---|
+> | curates `openimages_160x120/` | that is the old **6-class** pull (`appliances`, `birds`, `car`, `furniture`, `garden`, `people`). The current dataset is `everyday_openimages160x120` — 11 classes: `bookshelves`, `car`, `computer`, `crockery`, `cutlery`, `doors`, `fruit`, `furniture`, `garden`, `mouse`, `people` |
+> | `--dataset-source openimages_160x120` is the default | the default is `everyday_openimages160x120` |
+> | examples use `birds` | no such class any more |
+> | rejects go to `openimages_160x120_rejected/` | that directory does not exist; rejects are now recorded as **lists**, not moved files (see below) |
+>
+> **Use the current workflow instead:**
+> [`../finetune_curation.md`](../finetune_curation.md) —
+> `curation_pull.py` → `make_review_gallery.py` → `curation_resolve.py`,
+> operating on `data/` to build a fine-tuning set.
+>
+> The important design change between the two: this old workflow *moved
+> files*, so a dataset rebuild lost the curation. The current one records
+> rejected **filenames** in
+> `everyday_openimages160x120/meta/{split}_curation_rejects.json`, keyed by
+> source class. Those lists survive a `build_data.py` rebuild — including
+> the 2026-08-22 taxonomy change, where all 193 recorded rejects were
+> re-applied automatically to a class list that had itself changed.
+
+---
 
 Manual visual curation pass over `openimages_160x120/`, in small batches
 per class, using the existing gallery tool (`python_code/make_gallery.py`)

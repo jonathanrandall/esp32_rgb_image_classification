@@ -210,8 +210,8 @@ Every option in every script here, with its default. Extracted from the
 
 | option | type | default | meaning |
 |---|---|---|---|
-| `--rgb-block-width` | int | `8` | average this many pixels horizontally into one input value |
-| `--rgb-block-height` | int | `8` | as above, vertically |
+| `--rgb-block-width` | int | `5` | average this many pixels horizontally into one input value (32x24 grid; use 8 for the equal-resolution DCT control) |
+| `--rgb-block-height` | int | `5` | as above, vertically |
 | `--downsample-factor` | int | `1` | Lanczos resize to `(capture_w/f) x (capture_h/f)` instead; `1` = full resolution |
 
 Two traps here. First, block averaging is **on by default** — the default 8x8

@@ -148,6 +148,87 @@ def resolve_class_map(source_dir: Path, merge_map: dict, drop: set) -> dict:
     return class_map
 
 
+def split_processed_by_people(processed_dir: Path, source_dir: Path, class_names: list,
+                               threshold: float, min_train: int, min_val: int) -> list:
+    """Re-partition each class folder in processed_dir into
+    `<class>_people` / `<class>_no_people` using the YOLO person
+    confidences in meta/{split}_yolo_people.json. Returns the new class
+    list.
+
+    WHY THIS EXISTS. The default pipeline drops any image containing a
+    person from every class except `people` (see filter_intersections.py).
+    That was the right call for the benchmark -- it removed real
+    cross-class contamination -- but it teaches the model that a person
+    NEVER co-occurs with a computer, a car or a door. A camera pointed at
+    a real room shows exactly that co-occurrence, so the model meets a
+    combination it has no training signal for, and the test split cannot
+    reveal the problem because it was filtered the same way. Splitting
+    instead of dropping keeps those images and labels the co-occurrence
+    explicitly.
+
+    `people` is never split: a person in a `people` image is the point of
+    the class, not a contaminant.
+
+    A class is only split if BOTH resulting halves clear min_train and
+    min_val. Measured on the current 5-class set, `fruit_people` would
+    have ONE val image and `doors_people` forty train images -- classes
+    that can neither be trained nor scored. Those classes stay whole,
+    keeping their person-containing images rather than dropping them,
+    which is still strictly more signal than the filter gave. Which
+    classes actually split is printed, never assumed."""
+    yolo = {}
+    for split in ("train", "val"):
+        p = source_dir / "meta" / f"{split}_yolo_people.json"
+        if not p.exists():
+            raise SystemExit(f"--split-by-people needs {p}; run detect_people_yolo.py first.")
+        # {filename: confidence} flattened across source classes. Filenames
+        # carry their source class as a prefix (laptop_000123.jpg), so they
+        # stay unique after a merge collapses several sources into one dir.
+        flat = {}
+        for src_class, files in json.load(open(p)).items():
+            flat.update(files)
+        yolo[split] = flat
+
+    def has_person(split: str, fname: str) -> bool:
+        return yolo[split].get(fname, 0.0) >= threshold
+
+    new_names = []
+    for cls in sorted(class_names):
+        if cls == "people":
+            new_names.append(cls)
+            continue
+        counts = {}
+        for split in ("train", "val"):
+            d = processed_dir / split / cls
+            files = sorted(d.glob("*.jpg")) if d.exists() else []
+            counts[split] = (
+                [f for f in files if has_person(split, f.name)],
+                [f for f in files if not has_person(split, f.name)],
+            )
+        wp_tr, np_tr = counts["train"]
+        wp_va, np_va = counts["val"]
+        viable = (min(len(wp_tr), len(np_tr)) >= min_train
+                  and min(len(wp_va), len(np_va)) >= min_val)
+        if not viable:
+            print(f"  {cls}: NOT split -- would give people={len(wp_tr)}tr/{len(wp_va)}va, "
+                  f"no_people={len(np_tr)}tr/{len(np_va)}va (need >={min_train}tr, >={min_val}va both sides). "
+                  f"Class kept whole, person-containing images retained.")
+            new_names.append(cls)
+            continue
+        for split in ("train", "val"):
+            wp, npp = counts[split]
+            for suffix, group in (("_people", wp), ("_no_people", npp)):
+                dst = processed_dir / split / f"{cls}{suffix}"
+                dst.mkdir(parents=True, exist_ok=True)
+                for f in group:
+                    f.rename(dst / f.name)
+            (processed_dir / split / cls).rmdir()
+        print(f"  {cls}: split -> {cls}_people ({len(wp_tr)}tr/{len(wp_va)}va), "
+              f"{cls}_no_people ({len(np_tr)}tr/{len(np_va)}va)")
+        new_names += [f"{cls}_people", f"{cls}_no_people"]
+    return sorted(new_names)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source", default="everyday_openimages160x120",
@@ -167,6 +248,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-write-class-names", action="store_true",
                          help="build data/ but don't write dct_common/class_names.json -- preview-only run, "
                               "CLASS_NAMES stays whatever it currently is")
+    parser.add_argument("--out-dir", type=str, default="data",
+                         help="output dataset directory, relative to the project root (default: data). Use a "
+                              "different name to build an alternative dataset WITHOUT destroying the existing "
+                              "data/ -- train_cnn.py/train_rgb_cnn.py both take a matching --data-dir. Note "
+                              "--no-write-class-names is implied for any value other than 'data', since "
+                              "class_names.json describes data/.")
+    parser.add_argument("--split-by-people", action="store_true",
+                         help="instead of DROPPING person-containing images from every class except `people`, keep "
+                              "them and split each class into <class>_people / <class>_no_people using the YOLO "
+                              "confidences in meta/{split}_yolo_people.json. Implies --no-yolo-filter (the two are "
+                              "opposites: one drops the images this one needs). A class whose halves are too small "
+                              "to train or score is left whole -- see split_processed_by_people().")
+    parser.add_argument("--split-people-threshold", type=float, default=0.25,
+                         help="YOLO person confidence at or above which an image counts as containing a person "
+                              "(default: 0.25, matching filter_intersections.YOLO_PERSON_CONF_THRESHOLD)")
+    parser.add_argument("--split-min-train", type=int, default=150,
+                         help="minimum train images each half needs for a class to be split (default: 150)")
+    parser.add_argument("--split-min-val", type=int, default=15,
+                         help="minimum val images each half needs for a class to be split (default: 15)")
     parser.add_argument("--test-fraction", type=float, default=0.15,
                          help="fraction of each merged/filtered class's train images carved into data/test/ (default: 0.15)")
     parser.add_argument("--seed", type=int, default=1234)
@@ -196,27 +296,47 @@ def main() -> None:
     if processed_dir.exists():
         shutil.rmtree(processed_dir)
     print(f"-- Step 1: merging + filtering {source_dir} -> {processed_dir} --")
+    # --split-by-people needs the person images the YOLO filter exists to
+    # remove, so it forces that filter off. Stated out loud rather than
+    # silently overriding the flag.
+    apply_yolo = not args.no_yolo_filter and not args.split_by_people
+    if args.split_by_people and not args.no_yolo_filter:
+        print("  (--split-by-people implies --no-yolo-filter: keeping person-containing images so they can be split)")
     build_filtered_dataset(source_dir, processed_dir, class_map=class_map, apply_filter=not args.no_filter,
-                            apply_yolo_filter=not args.no_yolo_filter,
-                            apply_curation=not args.no_curation_filter)
+                            apply_yolo_filter=apply_yolo,
+                            apply_curation=not args.no_curation_filter,
+                            keep_people=args.split_by_people)
+
+    if args.split_by_people:
+        print()
+        print(f"-- Step 1b: splitting classes by person presence (YOLO conf >= {args.split_people_threshold}) --")
+        class_names = split_processed_by_people(
+            processed_dir, source_dir, class_names,
+            threshold=args.split_people_threshold,
+            min_train=args.split_min_train, min_val=args.split_min_val)
+        print(f"  final class list ({len(class_names)}): {class_names}")
 
     cfg = Config(
         capture_width=args.capture_width, capture_height=args.capture_height,
         chroma_subsampling=args.chroma_subsampling, seed=args.seed,
     )
     print()
-    print(f"-- Step 2: building {DATA_DIR} from {processed_dir} --")
-    build_openimages_dataset(DATA_DIR, cfg, test_fraction=args.test_fraction, source_dir=processed_dir, class_names=class_names)
+    out_dir = PROJECT_ROOT / args.out_dir
+    print(f"-- Step 2: building {out_dir} from {processed_dir} --")
+    build_openimages_dataset(out_dir, cfg, test_fraction=args.test_fraction, source_dir=processed_dir, class_names=class_names)
 
     print()
     print("=" * 70)
     print("DONE")
     print("=" * 70)
-    print(f"data/ written with class list: {class_names}")
+    print(f"{out_dir.name}/ written with class list: {class_names}")
     print(f"intermediate merged/filtered source kept at: {processed_dir}")
     print()
 
-    if args.no_write_class_names:
+    if args.out_dir != "data":
+        print(f"--out-dir {args.out_dir}: dct_common/class_names.json NOT touched (it describes data/).")
+        print(f"Train on this build with:  --data-dir {args.out_dir} --classes {','.join(class_names)}")
+    elif args.no_write_class_names:
         print("--no-write-class-names passed -- dct_common/class_names.json NOT touched.")
         print("CLASS_NAMES is still whatever it currently resolves to (see dct_common/config.py);")
         print(f"it will NOT match this data/ build's class list ({class_names}) until you either")

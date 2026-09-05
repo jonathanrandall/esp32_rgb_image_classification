@@ -131,6 +131,7 @@ def copy_filtered_class(
     yolo_meta: dict | None = None, apply_yolo_filter: bool = True,
     curation_rejects: dict | None = None, apply_curation: bool = True,
     stats: dict | None = None,
+    keep_people: bool = False,
 ) -> tuple:
     """Copy one source class's `split` *.jpg files into dst_class_dir
     (created if needed), dropping any that fail any of three independent
@@ -148,7 +149,15 @@ def copy_filtered_class(
     -- build_filtered_dataset (below, 1:1 filtering) and build_data.py
     (many-to-one class merging + filtering) both call it, rather than
     each having their own copy of this loop."""
-    exclude_labels = (DEFAULT_EXCLUDE | EXTRA_EXCLUDE.get(src_class_name, set())) if apply_filter else set()
+    # keep_people drops "people" from the exclusion set while leaving every
+    # OTHER exclusion (EXTRA_EXCLUDE's per-class rules) in force. It exists
+    # for build_data.py --split-by-people, which needs the person-containing
+    # images this filter would otherwise remove so it can LABEL the
+    # co-occurrence instead of pretending it never happens. Without this the
+    # YOLO filter alone is not enough: the intersections check here drops
+    # them too, via DEFAULT_EXCLUDE, and silently starves the split.
+    base_exclude = set() if keep_people else DEFAULT_EXCLUDE
+    exclude_labels = (base_exclude | EXTRA_EXCLUDE.get(src_class_name, set())) if apply_filter else set()
     class_meta = meta.get(src_class_name, {})  # {} for garden -- no meta, nothing filtered
     class_yolo_meta = (yolo_meta or {}).get(src_class_name, {}) if src_class_name != "people" else {}
     check_yolo = apply_yolo_filter and src_class_name != "people"
@@ -183,7 +192,7 @@ def copy_filtered_class(
 
 def build_filtered_dataset(source_dir: Path, dest_dir: Path, class_map: dict | None = None,
                             apply_filter: bool = True, apply_yolo_filter: bool = True,
-                            apply_curation: bool = True) -> None:
+                            apply_curation: bool = True, keep_people: bool = False) -> None:
     """class_map: {dest_class_name: [src_class_name, ...]} -- defaults to
     an identity mapping over every class folder found under
     source_dir/train (one source class per dest class, same name), this
@@ -217,7 +226,8 @@ def build_filtered_dataset(source_dir: Path, dest_dir: Path, class_map: dict | N
             for src_class_name in src_class_names:
                 kept, dropped = copy_filtered_class(source_dir, split, src_class_name, dst_class_dir, meta, apply_filter,
                                                       yolo_meta, apply_yolo_filter,
-                                                      curation_rejects, apply_curation, class_stats)
+                                                      curation_rejects, apply_curation, class_stats,
+                                                      keep_people=keep_people)
                 total_kept += kept
                 total_dropped += dropped
             for reason, n in class_stats.items():

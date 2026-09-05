@@ -272,6 +272,53 @@ Then copy `output/cnn/{model_weights.h,test_vectors.h}` into
 `src/dct_features.h` to match — a `static_assert` in `main.cpp` fails the build
 if they disagree.
 
+### Capturing real frames from the board
+
+Both models above are trained on Open Images photographs, and the camera
+produces something meaningfully different — a whole room rather than a padded
+crop around one object, indoor lighting, the OV2640's own exposure, and the
+sensor's own JPEG quantization tables. A model can score well on the test split
+and behave poorly on the board without either number being wrong.
+
+The sharpest case: the dataset pipeline **drops person-containing images from
+every class except `people`**, so the model has never seen a person and a
+computer in one frame — exactly what a camera pointed at a desk shows. The test
+split cannot reveal this, having been filtered the same way.
+
+```bash
+python capture_board_frames.py --label people --count 200 --interval 1.0 --show-prediction
+```
+
+Frames land in `board_captures/<label>/`, numbered continuously across runs.
+`--show-prediction` prints what the board currently thinks each frame is, which
+is the quickest way to find the live scenes the model gets wrong.
+
+**Capture from `esp32_classifier` only** — it is the one firmware serving
+`/frame`, and the only one whose JPEGs come from the OV2640's *hardware*
+encoder. `esp32_rgb_cnn` captures RGB565 and software-encodes its preview with
+`frame2jpg()`, so its frames carry the software encoder's quantization tables
+instead of the sensor's.
+
+That single capture set feeds **both** models: `train_cnn.py` reads the
+coefficients straight out of the bitstream, `train_rgb_cnn.py` decodes the same
+file to pixels. The reverse is impossible — hardware coefficients cannot be
+recovered from a software re-encode.
+
+Captured frames are already 160×120 at 4:2:2, so they need no resize or
+re-encode, and must not be given one.
+
+The board serves one viewer, so an open browser tab holds the stream slot and
+every `/frame` request times out. The tool calls `/claim` first to take it.
+
+> A cheaper idea was tried first and **failed**: `build_data.py
+> --split-by-people` labels the co-occurrence (`computer_people` /
+> `computer_no_people`) instead of dropping it, using the YOLO person
+> confidences already recorded for every image. The resulting model scored
+> precision 0.000 / recall 0.000 on both `_people` classes — it never predicted
+> them once. At a 15×20 DC grid a person inside a desk scene simply is not
+> separable. The flag is kept so the result can be reproduced, not because it
+> helped.
+
 ---
 
 ## CLI reference — the two training scripts
@@ -322,8 +369,8 @@ Output always goes to `output/cnn/` — this script has no `--artifacts-name`.
 | `--capture-height` | int | `120` | Build resolution of `data/`. |
 | `--chroma-subsampling` | `4:2:0` \| `4:2:2` | `4:2:2` | Only affects the `data/` build/reuse check — irrelevant to this model's own RGB decode. |
 | `--dataset-source` | str | `everyday_openimages160x120` | As `train_cnn.py`. |
-| `--rgb-block-width` | int | `8` | Average this many pixels horizontally into one input value. `8` makes it the exact equal-resolution control for the DCT arm (an 8×8 block mean *is* the DC coefficient); `5` is what this project ships; `1` is full resolution. |
-| `--rgb-block-height` | int | `8` | As above, vertically. |
+| `--rgb-block-width` | int | `5` | Average this many pixels horizontally into one input value. `5` gives the 32×24 grid this project ships. Use `8` for the exact equal-resolution DCT control (an 8×8 block mean *is* the DC coefficient, giving 20×15); `1` is full resolution. |
+| `--rgb-block-height` | int | `5` | As above, vertically. |
 | `--downsample-factor` | int | `1` | Resize decoded pixels down by this factor *before* block averaging. `1` = full capture resolution. |
 | `--classes` | csv | `None` → all classes | Subset of class names. |
 | `--conv-channels` | csv | `16,32,64` | Main conv stack. First stage is stride 1; every later stage is stride 2. The shipped model uses `32,32,64`. |

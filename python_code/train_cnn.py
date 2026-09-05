@@ -22,6 +22,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+from dct_common import config as config_module
 from dct_common.config import CLASS_NAMES, Config
 from dct_common.dataset import ensure_dataset
 from dct_common.device import benchmark_cpu_inference, get_device
@@ -57,6 +58,10 @@ def parse_args() -> argparse.Namespace:
                          help="Cb/Cr (chroma) AC coefficients kept per block on top of DC, independent of "
                               "--num-ac-coeffs -- e.g. 0 for chroma DC-only. Defaults to matching "
                               "--num-ac-coeffs (only meaningful with chroma enabled, i.e. without --no-chroma).")
+    parser.add_argument("--data-dir", type=str, default="data",
+                         help="dataset directory to train on, relative to the project root (default: data). Any "
+                              "value other than 'data' SKIPS ensure_dataset(), so a deliberately-built directory "
+                              "(e.g. a --split-by-people build) is never silently regenerated from --dataset-source.")
     parser.add_argument("--classes", type=str, default=None,
                          help="comma-separated subset of class names (default: all 23)")
     parser.add_argument("--epochs", type=int, default=60)
@@ -82,6 +87,21 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_config(args: argparse.Namespace) -> Config:
+    # Config validates selected_classes against dct_common.config.CLASS_NAMES,
+    # which is loaded from class_names.json -- and that file describes data/.
+    # An alternative --data-dir (a --split-by-people build, a curated set) has
+    # its own class list, so take the truth from the directory itself rather
+    # than from a sidecar written for a different dataset. Rebinding the module
+    # global is what the validation actually reads; the local `from ... import
+    # CLASS_NAMES` binding above is only used for the all-classes default.
+    if args.data_dir != "data":
+        d = PROJECT_ROOT / args.data_dir / "train"
+        if not d.is_dir():
+            raise SystemExit(f"--data-dir {args.data_dir}: {d} not found")
+        discovered = sorted(p.name for p in d.iterdir() if p.is_dir())
+        config_module.CLASS_NAMES = discovered
+        print(f"  class list taken from {args.data_dir}/train ({len(discovered)}): {discovered}")
+
     selected = tuple(c.strip() for c in args.classes.split(",")) if args.classes else None
     extra = tuple(int(c) for c in args.extra_conv_channels.split(",") if c.strip()) if args.extra_conv_channels else ()
     return Config(
@@ -226,13 +246,23 @@ def main() -> None:
     device = get_device()
 
     print("\n-- Dataset --")
-    ensure_dataset(DATA_DIR, cfg, source_dir=PROJECT_ROOT / args.dataset_source)
+    data_dir = PROJECT_ROOT / args.data_dir
+    if args.data_dir == "data":
+        ensure_dataset(data_dir, cfg, source_dir=PROJECT_ROOT / args.dataset_source)
+    else:
+        # Same reasoning as train_rgb_cnn.py's --data-dir: an alternative
+        # dataset (a people-split build, a hand-curated set) is assembled
+        # deliberately, and ensure_dataset() would see a class-list mismatch
+        # and silently rebuild it from --dataset-source, throwing that away.
+        if not data_dir.is_dir():
+            raise SystemExit(f"--data-dir {args.data_dir}: {data_dir} not found")
+        print(f"  using {data_dir} as-is (ensure_dataset skipped -- alternative dataset)")
 
     print("\n-- Feature extraction --")
-    X_train, Xc_train, y_train, _ = build_spatial_split(DATA_DIR, "train", cfg.active_class_names, cfg,
+    X_train, Xc_train, y_train, _ = build_spatial_split(data_dir, "train", cfg.active_class_names, cfg,
                                                          augment=args.use_augmentation, augment_copies=args.augment_copies)
-    X_val, Xc_val, y_val, _ = build_spatial_split(DATA_DIR, "val", cfg.active_class_names, cfg)
-    X_test, Xc_test, y_test, _ = build_spatial_split(DATA_DIR, "test", cfg.active_class_names, cfg)
+    X_val, Xc_val, y_val, _ = build_spatial_split(data_dir, "val", cfg.active_class_names, cfg)
+    X_test, Xc_test, y_test, _ = build_spatial_split(data_dir, "test", cfg.active_class_names, cfg)
     for name, X, Xc, y in (("train", X_train, Xc_train, y_train), ("val", X_val, Xc_val, y_val), ("test", X_test, Xc_test, y_test)):
         print(f"  {name}: Y={X.shape} chroma={Xc.shape} y={y.shape} class balance={np.bincount(y)}")
 

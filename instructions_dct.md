@@ -26,7 +26,47 @@ pip install torch numpy tqdm fiftyone ultralytics jpeglib pillow
 Nothing outside this repository is required. The dataset is downloaded in
 step 1; the YOLO weights are fetched by `ultralytics` in step 2.
 
-Hardware: **Freenove ESP32-S3-WROOM CAM** (OV2640), PSRAM required.
+Hardware: **Freenove ESP32-S3-WROOM CAM**, PSRAM required.
+
+> ### The camera module must be an OV2640
+>
+> Boards sold as "ESP32-S3 CAM" do not all carry the same sensor, and this
+> arm cannot work without an OV2640: it classifies the sensor's **hardware
+> JPEG** DCT coefficients, and a sensor with no JPEG encoder produces no
+> coefficients to read. That is not a settings problem — there is nothing
+> to decode. **Check the module before you buy the board.**
+>
+> The **GC0308** is the one most likely to turn up in its place (VGA, no
+> JPEG encoder). With one fitted, this firmware halts during `setup()`:
+>
+> ```
+> E (794) camera: JPEG format is not supported on this sensor
+> Camera init failed with error 0x106
+> Camera init failed, halting.
+> ```
+>
+> That halt is **before** `connect_wifi()`, so the board never joins the
+> network — the symptom you see is "it won't connect to Wi-Fi", which sends
+> you looking in the wrong place entirely. Two things hide the real cause:
+> `init_camera()` silences the camera driver's logging on purpose (raise
+> `esp_log_level_set("cam_hal"/"camera", ...)` to `ESP_LOG_VERBOSE` to see
+> the line above), and only this firmware routes `Serial` to USB, so the
+> same failure in `esp32_rgb_cnn` is completely silent.
+>
+> To identify the fitted sensor, init with `PIXFORMAT_RGB565` (which
+> non-JPEG sensors do support) and print it:
+>
+> ```c
+> sensor_t *s = esp_camera_sensor_get();
+> camera_sensor_info_t *si = esp_camera_sensor_get_info(&s->id);
+> Serial.printf("PID=0x%04x %s supports_jpeg=%d\n", s->id.PID, si->name, si->support_jpeg);
+> // OV2640 -> PID=0x0026 ... supports_jpeg=1
+> // GC0308 -> PID=0x009b ... supports_jpeg=0
+> ```
+>
+> The **RGB arm has no such requirement** — it reads raw RGB565, so any
+> sensor that does 160x120 RGB565 works. A GC0308 board runs
+> `esp32_rgb_cnn` fine.
 
 ---
 

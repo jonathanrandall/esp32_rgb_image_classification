@@ -25,7 +25,14 @@ pip install torch numpy tqdm fiftyone ultralytics jpeglib pillow
 Nothing outside this repository is required. The dataset is downloaded in
 step 1; the YOLO weights are fetched by `ultralytics` in step 2.
 
-Hardware: **Freenove ESP32-S3-WROOM CAM** (OV2640), PSRAM required.
+Hardware: **Freenove ESP32-S3-WROOM CAM**, PSRAM required.
+
+> **Any camera sensor that does RGB565 at 160x120 works here** — this arm
+> reads raw pixels, so it does not care which sensor is fitted. A board
+> carrying a **GC0308** instead of the usual OV2640 runs this firmware
+> fine. The **DCT arm is the one that requires an OV2640** specifically,
+> because it reads the sensor's hardware-JPEG coefficients; see
+> [`instructions_dct.md`](instructions_dct.md) step 0.
 
 ---
 

@@ -32,6 +32,73 @@ honest equal-resolution control rather than an arbitrary downsampler.
 
 ---
 
+## Hardware
+
+- I used the **Freenove ESP32-S3 CAM** board. **This is not recommended.** At
+  the time I bought this board, it shipped with the OV2640. It now ships with
+  the **GC0308** camera, which does not capture JPEG on hardware. The GC0308
+  will work with the pixel-domain arm but not the compressed-domain arm.
+- PSRAM required.
+- Capture is `PIXFORMAT_RGB565` at `FRAMESIZE_QQVGA` (160x120), set **at
+  `esp_camera_init()` time**. The "init at QVGA, then `set_framesize()` down"
+  trick is JPEG-only — doing it with RGB565 sizes the framebuffer for the
+  wrong format and you get a `Stack canary watchpoint triggered (cam_task)`
+  panic. This is noted in `src/main.cpp` where it bites.
+
+### Check your camera module: the DCT arm needs an OV2640
+
+Boards sold as "ESP32-S3 CAM" do not all carry the same sensor, and the two
+arms of this project do not have the same requirement:
+
+| | needs | why |
+|---|---|---|
+| **DCT arm** (`esp32_classifier`) | **OV2640 only** | it classifies the sensor's **hardware JPEG** DCT coefficients. A sensor with no JPEG encoder produces no coefficients to read |
+| **RGB arm** (`esp32_rgb_cnn`) | any sensor doing RGB565 at 160x120 | it reads raw pixels |
+
+So **buy or check for an OV2640** if the compressed-domain arm is what you
+came for. Substituting another sensor is not a matter of settings — there is
+nothing to decode.
+
+A **GC0308** is the module most likely to turn up in its place (a VGA sensor,
+no JPEG encoder). With one fitted, the DCT firmware stops during `setup()`
+like this:
+
+```
+E (794) camera: JPEG format is not supported on this sensor
+Camera init failed with error 0x106
+Camera init failed, halting.
+```
+
+`0x106` is `ESP_ERR_NOT_SUPPORTED`. Note where that halt sits: **before**
+`connect_wifi()`, so the board never joins the network and never answers
+`/status`. The symptom you actually see is "the board will not connect to
+Wi-Fi", which sends you looking in entirely the wrong place — the camera is
+working fine and the credentials are fine.
+
+Two things make this harder to diagnose than it should be, so check them
+first:
+
+- `init_camera()` calls `esp_log_level_set("cam_hal"/"camera", ESP_LOG_NONE)`
+  deliberately (the driver logging from `cam_task` overflows its stack — see
+  `stream_stall_issue.md`), which also silences the one line that names the
+  problem. Raise those to `ESP_LOG_VERBOSE` temporarily to see it.
+- On this board `Serial` reaches USB only because `esp32_classifier`'s
+  `platformio.ini` sets `-DARDUINO_USB_CDC_ON_BOOT=1`. `esp32_rgb_cnn` does
+  not, so the same failure there is completely silent on `/dev/ttyACM0`.
+
+To identify the fitted sensor, print it after a successful `esp_camera_init()`
+(use `PIXFORMAT_RGB565`, which non-JPEG sensors do support):
+
+```c
+sensor_t *s = esp_camera_sensor_get();
+camera_sensor_info_t *si = esp_camera_sensor_get_info(&s->id);
+Serial.printf("PID=0x%04x %s supports_jpeg=%d\n", s->id.PID, si->name, si->support_jpeg);
+// OV2640 -> PID=0x0026 ... supports_jpeg=1
+// GC0308 -> PID=0x009b ... supports_jpeg=0
+```
+
+---
+
 ## Why average blocks instead of resizing
 
 A 5x5 box mean is not an arbitrary choice of downsampler. It is the same
@@ -121,17 +188,6 @@ per-layer breakdown:
 inference: capturing RGB565 means the frame cannot double as the stream, so
 previewing costs a software encode. That is a property of the pixel-domain
 pipeline, not of the model.
-
----
-
-## Hardware
-
-- **Freenove ESP32-S3-WROOM CAM** (OV2640), PSRAM required.
-- Capture is `PIXFORMAT_RGB565` at `FRAMESIZE_QQVGA` (160x120), set **at
-  `esp_camera_init()` time**. The "init at QVGA, then `set_framesize()` down"
-  trick is JPEG-only — doing it with RGB565 sizes the framebuffer for the
-  wrong format and you get a `Stack canary watchpoint triggered (cam_task)`
-  panic. This is noted in `src/main.cpp` where it bites.
 
 ---
 

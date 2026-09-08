@@ -58,7 +58,7 @@ python train_cnn.py \
     --capture-width 160 --capture-height 120 --chroma-subsampling 4:2:2 \
     --num-ac-coeffs 3 --num-chroma-ac-coeffs 0 \
     --extra-conv-channels 32 \
-    --classes people,computer,doors,fruit,car,garden \
+    --classes computer,fruit,people,doors,car \
     --use-augmentation
 ```
 
@@ -185,6 +185,9 @@ improved on-camera behaviour here.
 ```bash
 cd python_code
 python capture_board_frames.py --label people --count 200 --interval 1.0 --show-prediction
+
+# or, to see what you are capturing (SPACE saves, class from a dropdown):
+python capture_board_frames.py --interactive --label people
 ```
 
 Frames land in `board_captures/<label>/` at 160×120 4:2:2 — already the
@@ -212,3 +215,7 @@ Then retrain from step 2.
 
 `--show-prediction` prints what the board currently thinks each frame is,
 which is the fastest way to find the live scenes the model gets wrong.
+`--interactive` puts the same prediction next to a live preview and turns it
+orange when it disagrees with the class you are saving as, so those scenes can
+be captured on sight; it needs tkinter (`sudo apt install python3-tk`), which
+the headless path does not. Both write the socket's bytes untouched.

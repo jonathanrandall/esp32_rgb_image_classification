@@ -5,9 +5,9 @@ domain**: the camera is read as raw RGB565, reduced to a 32x24 grid by
 averaging 5x5 blocks of pixels, and classified by a small int8 CNN running
 under [ESP-NN](https://github.com/espressif/esp-nn).
 
-Six classes: `people`, `computer`, `doors`, `fruit`, `car`, `garden`.
+Five classes: `computer`, `fruit`, `people`, `doors`, `car`.
 
-**83.0% int8 test accuracy on 2,304 input values per frame**, 82.3% balanced. Everything here
+**81.7% int8 test accuracy on 2,304 input values per frame**, 80.0% balanced. Everything here
 — training, quantization, C export, bit-exactness verification, and the
 firmware — is what produced the weights in
 `esp32_cam/esp32_rgb_cnn/include/model_weights.h`.
@@ -80,17 +80,28 @@ shipped weights:
 
 | split | float | QAT | int8 |
 |---|---:|---:|---:|
-| train | 84.2% | 86.8% | 88.5% |
-| val | 84.3% | 85.9% | 85.5% |
-| test | 81.3% | 82.9% | **83.0%** |
+| train | 79.3% | 84.5% | 86.7% |
+| val | 79.8% | 82.5% | 82.5% |
+| test | 78.7% | 81.5% | **81.7%** |
 
 Balanced (macro-averaged per-class recall), which weights every class equally:
-**82.3%** on test.
+**80.0%** on test.
 
-The compressed-domain arm on the same six classes and the same data:
-**81.7%** int8, 80.2% balanced.
+Per class, on the test split — precision alongside predicted share, because
+balanced accuracy is macro *recall* and is blind to a class that over-fires:
 
-int8-vs-QAT prediction agreement: **99.7%**. The int8 reference is bit-exact
+| class | recall | precision | predicted share | actual share |
+|---|---:|---:|---:|---:|
+| computer | 89.6% | 85.6% | 39.4% | 37.7% |
+| fruit | 68.6% | 83.5% | 13.3% | 16.2% |
+| people | 67.1% | 71.0% | 16.0% | 16.9% |
+| doors | 87.2% | 85.4% | 16.6% | 16.3% |
+| car | 87.5% | 77.2% | 14.7% | 12.9% |
+
+The compressed-domain arm on the same five classes and the same data:
+**79.2%** int8, 77.4% balanced.
+
+int8-vs-QAT prediction agreement: **99.8%**. The int8 reference is bit-exact
 against the C export — see *Verification* below.
 
 QAT scoring above float is not a typo; quantization noise acts as a
@@ -243,7 +254,7 @@ python build_data.py
 # 2. train: float -> QAT -> bit-exact int8
 python train_rgb_cnn.py \
     --rgb-block-width 5 --rgb-block-height 5 \
-    --classes people,computer,doors,fruit,car,garden \
+    --classes computer,fruit,people,doors,car \
     --conv-channels 32,32,64 --use-augmentation
 
 # 3. export C weights and verify them against the Python int8 reference
@@ -264,7 +275,7 @@ verifier:
 python train_cnn.py \
     --capture-width 160 --capture-height 120 --chroma-subsampling 4:2:2 \
     --num-ac-coeffs 2 --num-chroma-ac-coeffs 0 \
-    --classes people,computer,doors,fruit,car,garden --use-augmentation
+    --classes computer,fruit,people,doors,car --use-augmentation
 
 python export_cnn_c_weights.py cnn     # -> output/cnn/model_weights.h
 python verify_cnn_c_export.py cnn      # expect 25/25 bit-exact
@@ -275,32 +286,118 @@ Then copy `output/cnn/{model_weights.h,test_vectors.h}` into
 `src/dct_features.h` to match — a `static_assert` in `main.cpp` fails the build
 if they disagree.
 
-### Capturing real frames from the board
+## Capturing frames from the board (`capture_board_frames.py`)
 
-Both models above are trained on Open Images photographs, and the camera
-produces something meaningfully different — a whole room rather than a padded
-crop around one object, indoor lighting, the OV2640's own exposure, and the
-sensor's own JPEG quantization tables. A model can score well on the test split
-and behave poorly on the board without either number being wrong.
+Both models are trained on Open Images photographs, and the camera produces
+something meaningfully different — a whole room rather than a padded crop
+around one object, indoor lighting, the OV2640's own exposure, and the sensor's
+own JPEG quantization tables. A model can score well on the test split and
+behave poorly on the board without either number being wrong. This tool closes
+that gap by collecting training data through the camera itself.
 
 The sharpest case: the dataset pipeline **drops person-containing images from
 every class except `people`**, so the model has never seen a person and a
 computer in one frame — exactly what a camera pointed at a desk shows. The test
 split cannot reveal this, having been filtered the same way.
 
+### Running it
+
+Flash `esp32_cam/esp32_classifier` and note the board's address (it answers to
+`esp32cam_dct.local`; `--host` takes an IP if mDNS is not working). Then, from
+`python_code/`:
+
 ```bash
+# headless — capture 200 frames blind, ~1s apart
 python capture_board_frames.py --label people --count 200 --interval 1.0 --show-prediction
+
+# interactive — a live preview window; SPACE saves the frame on screen
+python capture_board_frames.py --interactive --label people
+
+# a board that mDNS cannot find
+python capture_board_frames.py --host 192.168.1.125 --label car --count 50
 ```
 
-Frames land in `board_captures/<label>/`, numbered continuously across runs.
-`--show-prediction` prints what the board currently thinks each frame is, which
-is the quickest way to find the live scenes the model gets wrong.
+| option | default | what it does |
+|---|---|---|
+| `--label` | *(required)* | class name; the output subdirectory and filename prefix |
+| `--count` | `100` | frames to capture (headless only) |
+| `--interval` | `0.5` | seconds between captures, and the auto-capture period in the window |
+| `--host` | `esp32cam_dct.local` | board hostname or IP |
+| `--port` | `81` | stream port, where `/frame` and `/stream` live |
+| `--out-dir` | `../board_captures` | output root |
+| `--timeout` | `10.0` | per-request timeout, seconds |
+| `--show-prediction` | off | print the board's own top class per frame (headless) |
+| `--interactive` | off | open the preview window instead of capturing blind |
+| `--labels` | *(from the board)* | extra classes for the dropdown, comma-separated |
+| `--scale` | `4` | preview magnification — 160×120 shown at 640×480 |
+| `--status-interval` | `0.4` | seconds between `/status` polls, the source of the live prediction |
+
+Frames land in `board_captures/<label>/<label>_NNNNNN.jpg`, numbered
+continuously across runs so several sessions — different rooms, different light
+— accumulate into one class.
+
+### The interactive window
+
+```bash
+python capture_board_frames.py --interactive --label people
+```
+
+Shows the live stream, the board's current prediction, and a per-class tally.
+
+| key | what it does |
+|---|---|
+| `SPACE` | save the frame on screen |
+| `A` | toggle auto-capture every `--interval` seconds |
+| `U` | undo — delete the frame just saved |
+| `1`–`9` | switch class, same as picking it from the dropdown |
+| `C` | re-claim the stream slot (a browser tab took it) |
+| `Q` / `Esc` | quit |
+
+The class is a **dropdown** that can be changed mid-session, and it is
+editable: type a name that is not in the list, press Enter, and it is added —
+which is what you want when collecting data for a class the model does not have
+yet. Leave `--labels` off and the list fills itself from the class names the
+*flashed model* reports in `/status`, so it always matches what is running.
+
+The prediction turns **orange when it disagrees** with the class being saved
+as. Frames the model gets wrong are the highest-value data in this pipeline,
+and that makes them capturable on sight rather than findable afterwards by
+reading log output.
+
+While the dropdown has keyboard focus it is a text field, so `SPACE`, `A`, `U`
+and `Q` type characters instead of firing; `Esc`, or picking an entry, hands
+focus back.
+
+It needs tkinter (`sudo apt install python3-tk` on Linux; bundled with CPython
+elsewhere) and Pillow. Both are imported only when `--interactive` is passed,
+so the headless path still runs on a stdlib-only Python.
+
+### Folding captures into the dataset
+
+```bash
+for f in ../board_captures/people/*.jpg; do
+    cp "$f" "../data/train/people/board_$(basename "$f")"
+done
+```
+
+Then retrain normally. Two things to get right:
+
+- **Use a distinct prefix.** Capture filenames collide with Open Images ones —
+  73 of the first 93 did here.
+- **Copy, never move.** `board_captures/` is the only copy and is not
+  reproducible, while `data/` is deleted and rebuilt by `build_data.py`.
+
+Vary the scene while capturing. Near-duplicate frames of one static setup
+inflate the count without adding information.
+
+### Why it works the way it does
 
 **Capture from `esp32_classifier` only** — it is the one firmware serving
 `/frame`, and the only one whose JPEGs come from the OV2640's *hardware*
 encoder. `esp32_rgb_cnn` captures RGB565 and software-encodes its preview with
 `frame2jpg()`, so its frames carry the software encoder's quantization tables
-instead of the sensor's.
+instead of the sensor's. Requesting `/frame` from it exits with that
+explanation rather than a bare 404.
 
 That single capture set feeds **both** models: `train_cnn.py` reads the
 coefficients straight out of the bitstream, `train_rgb_cnn.py` decodes the same
@@ -308,10 +405,21 @@ file to pixels. The reverse is impossible — hardware coefficients cannot be
 recovered from a software re-encode.
 
 Captured frames are already 160×120 at 4:2:2, so they need no resize or
-re-encode, and must not be given one.
+re-encode, and **must not be given one**. This is why the preview window is a
+native tkinter window rather than an HTML page like the curation galleries:
+saving a frame from a browser canvas re-encodes it, replacing the OV2640's
+quantization tables with the browser's and destroying the one property that
+makes a board capture worth more than an Open Images photograph.
+`Image.open(...).save(...)` is the same trap in Python, so PIL here draws the
+preview and never touches what is written — the bytes go from the socket
+straight to the file. Both modes are identical in that respect; they differ
+only in how they reach the board (headless polls the bounded `/frame`,
+interactive holds one `/stream` connection).
 
-The board serves one viewer, so an open browser tab holds the stream slot and
-every `/frame` request times out. The tool calls `/claim` first to take it.
+The board serves **one** viewer, so an open browser tab — or a stale socket
+from a closed one — holds the stream slot and every request times out, which
+looks exactly like a dead board. Both modes call `/claim` on port 80 first, and
+again after any failure, to take it back.
 
 > A cheaper idea was tried first and **failed**: `build_data.py
 > --split-by-people` labels the co-occurrence (`computer_people` /
@@ -340,7 +448,7 @@ supplies its own; `None` means "computed at runtime", explained in the notes.
 | `--dataset-source` | str | `everyday_openimages160x120` | Source directory (relative to the project root) that `data/` is built from. |
 | `--num-ac-coeffs` | int | `3` | Luma AC coefficients kept per 8×8 block **on top of** DC. `0` = DC-only. See the warning below before raising it. |
 | `--num-chroma-ac-coeffs` | int | `None` → matches `--num-ac-coeffs` | Chroma AC count, independent of luma. **Set this to `0` on OV2640 hardware** (see below). |
-| `--classes` | csv | `None` → all classes | Subset of class names, e.g. `people,computer,doors,fruit,car,garden`. |
+| `--classes` | csv | `None` → all classes | Subset of class names, e.g. `computer,fruit,people,doors,car`. |
 | `--epochs` | int | `60` | Float-training epochs. Early stopping patience is 12. |
 | `--qat-epochs` | int | `20` | Quantization-aware fine-tuning epochs after float training. |
 | `--dropout` | float | `0.3` | Dropout before the classifier head. |
@@ -428,7 +536,7 @@ itself — see the reproducibility caveat below.
 
 ### Using your own classes
 
-Nothing here is tied to the six classes this project ships. To pick your own:
+Nothing here is tied to the five classes this project ships. To pick your own:
 
 1. Edit `CLASS_MAP` in `get_everyday_openimages_data.py` — the Open Images
    V7 class names to pull, and how many per class (`TRAIN_PER_CLASS`,
@@ -542,6 +650,8 @@ python_code/                 training, export, verification -- both arms
   export_to_firmware.py        export -> verify -> back up -> install -> flash (RGB)
   export_cnn_c_weights.py      \  the DCT arm's export/verify pair, run by hand
   verify_cnn_c_export.py       /
+  capture_board_frames.py      collect training frames through the camera itself
+  capture_interactive.py         the --interactive preview window
   dct_common/                  shared library (feature extraction, QAT, quantization)
 
 data_curation/               how the raw pull was selected and filtered

@@ -84,7 +84,7 @@ See [`../data_curation/`](../data_curation/) for the selection tooling.
 ```bash
 python train_rgb_cnn.py \
     --rgb-block-width 5 --rgb-block-height 5 \
-    --classes people,computer,doors,fruit,car,garden \
+    --classes computer,fruit,people,doors,car \
     --use-augmentation
 ```
 
@@ -120,18 +120,18 @@ Writes to `output/<artifacts-name>/`: `float_model.pt`, `qat_model.pt`,
 artifacts rather than remembered:
 
 ```
---rgb-block-width 5 --rgb-block-height 5 --classes people,computer,doors,fruit,car,garden --use-augmentation --conv-channels 32,32,64
+--rgb-block-width 5 --rgb-block-height 5 --classes computer,fruit,people,doors,car --use-augmentation --conv-channels 32,32,64
 ```
 
 | | |
 |---|---|
-| classes | people, computer, doors, fruit, car, garden |
+| classes | computer, fruit, people, doors, car |
 | reduction | 5x5 block mean -> 32x24 |
 | architecture | conv 32,32,64 + extra 32 |
 | epochs | 60 float, 20 QAT |
 | augmentation | on |
 | seed | 1234 |
-| int8 test | 83.0% |
+| int8 test | 81.7% |
 
 Note the first conv stage is **32** channels here, not the `16,32,64` default —
 widening it was worth ~2 points. All four layers stay well under the ESP-NN

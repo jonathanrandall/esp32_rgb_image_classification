@@ -596,12 +596,37 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <style>
     body { background:#111; color:#eee; font-family:sans-serif; text-align:center; margin:0; padding:16px; }
     /* The video is an <iframe> pointed straight at :81/stream, NOT a
-       <canvas> fed by fetch(). See the script below for why. overflow is
-       left visible deliberately: border-radius + overflow:hidden + a
-       transformed child is a known bad combination in WebKit and cropped
-       the right edge on iPhone in the sibling firmware. */
-    #streamBox { display:inline-block; border:2px solid #444; border-radius:8px; width:160px; height:120px; }
-    #streamFrame { display:block; width:160px; height:120px; border:none; image-rendering:pixelated; }
+       <canvas> fed by fetch(). See the script below for why.
+
+       Shown at 2x, matching the DCT firmware. An iframe does not stretch
+       its embedded content to fill the frame box the way <img>/<canvas>
+       do, so scaling the ELEMENT is the only lever: the iframe stays
+       160x120 (the real frame size, so the stream is not resampled by
+       the browser) and transform:scale(2) draws it twice as large, with
+       the box sized 320x240 to reserve the space the transform does not
+       claim in layout.
+
+       overflow stays VISIBLE deliberately -- border-radius +
+       overflow:hidden + a transformed child is a known bad combination
+       in WebKit and cropped the right edge on iPhone in the sibling
+       firmware. */
+    #streamBox {
+      display:inline-block;
+      border:2px solid #444;
+      border-radius:8px;
+      overflow:visible;
+      width:320px;
+      height:240px;
+    }
+    #streamFrame {
+      display:block;
+      width:160px;
+      height:120px;
+      border:none;
+      transform:scale(2);
+      transform-origin:top left;
+      image-rendering:pixelated;
+    }
     #fps { font-size:1.4em; margin:12px; }
     #timing { font-size:0.9em; color:#aaa; margin-bottom:12px; }
     #scores { max-width:320px; margin:0 auto 16px; text-align:left; }
@@ -625,14 +650,17 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     table.diag td.hd { color:#888; }
     .psram { color:#f97; }
     .sram { color:#7fd; }
-    .warn { color:#fc6; font-size:0.85em; margin:8px auto; max-width:640px; text-align:left; line-height:1.4; }
+    /* Shown ONLY on a numerics self-test failure -- see updateStatus().
+       Red, because by the time this appears the numbers on the page are
+       wrong. */
+    .warn { color:#f66; font-size:0.85em; margin:8px auto; max-width:640px; text-align:left; line-height:1.4; }
     button { background:#333; color:#eee; border:1px solid #555; border-radius:4px; padding:4px 10px; margin:2px; cursor:pointer; font-size:0.85em; }
     button.on { background:#7fd; color:#111; border-color:#7fd; }
   </style>
 </head>
 <body>
   <h2>ESP32-S3 RGB pixel CNN (160x120, portable int8 kernels)</h2>
-  <div class="warn" id="caveat"></div>
+  <div class="warn" id="caveat" style="display:none"></div>
   <div id="fps">FPS: --</div>
   <div id="scores"></div>
   <div id="timing"></div>
@@ -804,32 +832,31 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }
 
       const st = j.self_test || {};
-      const t = (g) => g ? g.ok + '/' + g.total : '?';
-      let caveat = j.esp_nn
-        ? '<b>ESP-NN enabled</b> (esp32s3 int8 kernels). Compare against the DCT ' +
-          'firmware&rsquo;s ESP-NN figures — 21.9 ms inference / 23.7 fps — not its portable ones.'
-        : '<b>No ESP-NN in this build.</b> These kernels are portable C. Compare against the ' +
-          'DCT firmware&rsquo;s portable figures — 306 ms inference / 2.3 fps — not its ' +
-          'headline 23.7 fps.';
-      if (st.status === 'pass') {
-        // On an ESP-NN build, class agreement is the bar and small logit drift
-        // is expected; claiming "bit-exact" there would be wrong.
-        caveat += st.bit_exact_all
-          ? '<br>Numerics self-test <b>PASS</b> — bit-exact vs the PC int8 reference on all ' +
-            (st.class_total || 0) + ' vectors.'
-          : '<br>Numerics self-test <b>PASS</b> — predicted class matches the PC int8 reference ' +
-            'on ' + (st.class_ok || 0) + '/' + (st.class_total || 0) + ' vectors (max logit drift ' +
-            (st.max_logit_diff || 0) + '), bit-exact on pattern ' + t(st.pattern) + ', synth ' +
-            t(st.synth) + ', real ' + t(st.real) + '. Small drift is expected from ESP-NN&rsquo;s ' +
-            'two-step requantize.';
-      } else {
-        caveat += '<br><b>Numerics self-test FAIL</b> — class match ' + (st.class_ok || 0) + '/' +
-                  (st.class_total || 0) + ', max logit drift ' + (st.max_logit_diff || 0) +
-                  ', determinism ' + (st.determinism_ok ? 'ok' : 'FAILED') +
-                  '. Timings below are measuring the wrong computation. If a browser was ' +
-                  'connected while the board booted, reload after the self-test completes.';
+      // Only a FAILURE is shown here now. This used to carry a standing
+      // notice on every load -- which build (ESP-NN or portable C), which
+      // DCT figures to compare against, and the self-test PASS detail --
+      // but a banner that is present even when everything is fine is
+      // noise on a page whose job is to show the camera. The same
+      // information is all in /status, which is where it belongs.
+      //
+      // The failure case is worth keeping and is deliberately loud: if
+      // the numerics self-test did not pass, every timing below is
+      // measuring the wrong computation and the classifier output cannot
+      // be trusted. Red rather than the old yellow, so it reads as a
+      // fault rather than as the notice that used to live here.
+      let caveat = '';
+      if (st.status && st.status !== 'pass') {
+        caveat = '<b>Numerics self-test FAIL</b> — class match ' + (st.class_ok || 0) + '/' +
+                 (st.class_total || 0) + ', max logit drift ' + (st.max_logit_diff || 0) +
+                 ', determinism ' + (st.determinism_ok ? 'ok' : 'FAILED') +
+                 '. Timings below are measuring the wrong computation. If a browser was ' +
+                 'connected while the board booted, reload after the self-test completes.';
       }
-      document.getElementById('caveat').innerHTML = caveat;
+      const cav = document.getElementById('caveat');
+      cav.innerHTML = caveat;
+      // Hidden rather than merely empty, so its margins do not leave a gap
+      // under the heading in the normal (passing) case.
+      cav.style.display = caveat ? '' : 'none';
     }
 
     async function setSwap(v) { try { await fetch('/config?swap=' + v); } catch (e) {} }

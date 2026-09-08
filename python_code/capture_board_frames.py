@@ -27,12 +27,19 @@ Images land at the board's native capture size (160x120, 4:2:2), already
 the training resolution, so build_data.py's resize step is a no-op on
 them and no re-encode is needed.
 
+There are two modes. Headless is better for bulk ("200 frames while I walk
+around with the board"); interactive is better for aimed capture, because
+you can see the scene and the board's own prediction while you decide.
+
 Usage:
-    # capture 200 frames of you sitting at your desk
+    # headless: capture 200 frames of you sitting at your desk
     python capture_board_frames.py --label computer_people --count 200
 
     # slower, for moving the camera around between shots
     python capture_board_frames.py --label people --count 100 --interval 1.0
+
+    # interactive: live preview window, SPACE to save the frame on screen
+    python capture_board_frames.py --interactive --label people
 
     # a different board
     python capture_board_frames.py --host 192.168.1.50 --label car --count 50
@@ -40,6 +47,13 @@ Usage:
 Frames are written to ../board_captures/<label>/<label>_<n>.jpg, numbered
 so a later run appends rather than overwriting. Point build_data.py's
 --source at a directory of these, or merge them into an existing dataset.
+
+The two modes differ only in how they reach the board -- headless polls
+the bounded /frame endpoint, interactive holds one /stream connection --
+never in what they write. Both put the socket's bytes on disk untouched,
+which is the point: the OV2640's quantization tables are what make these
+frames worth more than an Open Images photograph, and any re-encode
+replaces them.
 """
 
 import argparse
@@ -77,6 +91,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--show-prediction", action="store_true",
                    help="print the board's own top class for each frame, read from the status part. "
                         "Useful for spotting exactly which live scenes the current model gets wrong.")
+
+    g = p.add_argument_group("interactive mode")
+    g.add_argument("--interactive", action="store_true",
+                   help="open a live preview window and save on a keypress, instead of capturing "
+                        "--count frames blind. Holds ONE connection to /stream and writes the bytes "
+                        "exactly as they arrive, so the frames are identical to the headless ones. "
+                        "Needs tkinter; the headless path above does not.")
+    g.add_argument("--labels", default="",
+                   help="comma-separated extra classes selectable with the number keys in the "
+                        "window (--label stays the one selected at startup). If omitted, the "
+                        "selector is filled from the class names the board itself reports.")
+    g.add_argument("--scale", type=int, default=4,
+                   help="preview magnification (default: 4, i.e. 160x120 shown at 640x480). "
+                        "Display only -- what gets saved is always the original 160x120 bytes.")
+    g.add_argument("--status-interval", type=float, default=0.4,
+                   help="seconds between /status polls on port 80, which is where the live "
+                        "prediction comes from (default: 0.4). Port 80 is a separate httpd "
+                        "instance, so it answers while port 81 is busy streaming.")
     return p.parse_args()
 
 
@@ -95,6 +127,64 @@ def split_multipart(body: bytes) -> list:
         # The trailing CRLF before the next boundary is framing, not data.
         parts.append((head, payload.rstrip(b"\r\n")))
     return parts
+
+
+class MultipartStreamReader:
+    """Incremental reader for the board's never-ending /stream response.
+
+    split_multipart() above reads /frame, which is *bounded* -- one image,
+    one status, then the response ends -- so it can take the whole body and
+    split it. /stream never ends, so it has to be consumed part by part as
+    the bytes arrive.
+
+    This never scans binary data for the boundary, because it does not have
+    to: every part the firmware writes carries a Content-Length (see
+    STREAM_PART_FMT / STREAM_JSON_PART_FMT in main.cpp). Find the boundary
+    line, read the small header block, then read exactly that many bytes.
+    Boundary-scanning a JPEG body would risk matching a byte sequence
+    inside the entropy-coded data.
+    """
+
+    def __init__(self, fp, boundary: bytes = PART_BOUNDARY, chunk: int = 8192):
+        self._fp = fp
+        self._sep = b"--" + boundary
+        self._chunk = chunk
+        self._buf = b""
+
+    def _fill(self) -> None:
+        data = self._fp.read(self._chunk)
+        if not data:
+            raise EOFError("stream closed by the board")
+        self._buf += data
+
+    def _read_until(self, marker: bytes) -> bytes:
+        while True:
+            i = self._buf.find(marker)
+            if i >= 0:
+                head, self._buf = self._buf[:i], self._buf[i + len(marker):]
+                return head
+            self._fill()
+
+    def _read_exactly(self, n: int) -> bytes:
+        while len(self._buf) < n:
+            self._fill()
+        out, self._buf = self._buf[:n], self._buf[n:]
+        return out
+
+    def next_part(self) -> tuple:
+        """(content_type_str, payload_bytes) for the next part on the wire."""
+        self._read_until(self._sep)                 # framing before the part
+        head = self._read_until(b"\r\n\r\n")
+        headers = {}
+        for line in head.split(b"\r\n"):
+            key, _, val = line.partition(b":")
+            if val:
+                headers[key.strip().lower()] = val.strip()
+        ctype = headers.get(b"content-type", b"").decode("ascii", "replace")
+        length = headers.get(b"content-length")
+        if length is None:
+            raise ValueError(f"stream part with no Content-Length: {head[:80]!r}")
+        return ctype, self._read_exactly(int(length))
 
 
 def claim_stream(host: str, timeout: float) -> bool:
@@ -172,18 +262,58 @@ def top_class(status: dict) -> str:
     return str(status.get("class", status.get("top", "?")))
 
 
+def top_scores(status: dict, n: int = 3) -> list:
+    """[(class_name, percent), ...] highest first, from a /status or stream
+    status part. build_status_json() already sorts `scores` descending and
+    softmaxes the int8 logits into percentages that sum to 100; this only
+    reshapes them. Empty until the board has classified its first frame
+    (`g_has_classified`), so an empty list means "not yet", not "failed"."""
+    if not isinstance(status, dict):
+        return []
+    out = []
+    for entry in status.get("scores", [])[:n]:
+        if isinstance(entry, dict):
+            out.append((str(entry.get("class", "?")), float(entry.get("pct", 0.0))))
+    return out
+
+
+def next_index(out_dir: Path, label: str) -> int:
+    """First unused frame number in out_dir, continuing across runs.
+
+    Several sessions (different rooms, different lighting) should
+    accumulate into one class rather than overwrite each other."""
+    existing = sorted(out_dir.glob(f"{label}_*.jpg"))
+    if not existing:
+        return 0
+    nums = [int(p.stem.rsplit("_", 1)[1]) for p in existing if p.stem.rsplit("_", 1)[1].isdigit()]
+    return max(nums) + 1 if nums else len(existing)
+
+
 def main() -> None:
     args = parse_args()
+
+    if args.interactive:
+        # Imported here, not at the top, so the headless path keeps running
+        # on a machine with no tkinter -- which is the normal state of a
+        # fresh Linux install, since tkinter ships as a separate package.
+        try:
+            from capture_interactive import run_interactive
+        except ImportError as e:
+            raise SystemExit(
+                f"--interactive could not start: {e}\n\n"
+                "It needs tkinter and Pillow:\n"
+                "    sudo apt install python3-tk      # Debian/Ubuntu\n"
+                "    pip install pillow\n\n"
+                "The headless capture (drop --interactive) needs neither."
+            ) from None
+        run_interactive(args)
+        return
+
     out_dir = Path(args.out_dir) / args.label
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Continue the numbering rather than overwriting, so several sessions
-    # (different rooms, different lighting) accumulate into one class.
     existing = sorted(out_dir.glob(f"{args.label}_*.jpg"))
-    start = 0
-    if existing:
-        nums = [int(p.stem.rsplit("_", 1)[1]) for p in existing if p.stem.rsplit("_", 1)[1].isdigit()]
-        start = max(nums) + 1 if nums else len(existing)
+    start = next_index(out_dir, args.label)
 
     # Take the stream slot before the first request, and again after any
     # failure -- a browser reconnecting mid-run would otherwise take it back

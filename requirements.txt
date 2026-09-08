@@ -36,3 +36,14 @@ jpeglib>=1.0                # tested 1.0.2
 
 fiftyone>=1.0               # tested 1.20.1  -- get_everyday_openimages_data.py
 ultralytics>=8.0            # tested 8.4.120 -- detect_people_yolo.py (YOLO11m)
+
+# ---------------------------------------------------------------------------
+# Interactive board capture -- only for capture_board_frames.py --interactive
+# ---------------------------------------------------------------------------
+# tkinter cannot be pip-installed: it ships with CPython on Windows and
+# macOS, but is a separate system package on Linux.
+#
+#     sudo apt install python3-tk        # Debian/Ubuntu
+#
+# Pillow (above) is the only pip dependency the window adds. Headless
+# capture needs neither -- it is stdlib only.

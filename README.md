@@ -175,19 +175,30 @@ QAT scoring above float is not a typo; quantization noise acts as a
 regularizer on a model this small.
 
 Measured on the board via `GET /status`, which reports per-frame timing and a
-per-layer breakdown:
+per-layer breakdown. **Both block sizes are listed, because the choice of
+block is also a choice of speed** — it sets the model's input resolution:
 
-| stage | ms |
-|---|---:|
-| RGB565 -> block-mean convert | 3.5 |
-| **inference** | **21.0** |
-| JPEG encode (for the preview stream) | 18.8 |
-| total | 43.5 |
+| stage | 5x5 blocks (shipped) | 8x8 blocks |
+|---|---:|---:|
+| RGB565 capture | 0-3 | 0-3 |
+| RGB565 -> block-mean convert | 3.4 | 3.5 |
+| **inference** | **30.7** | **21.0** |
+| JPEG encode (for the preview stream) | 18.2 | 18.8 |
+| total | 52.3 | 43.5 |
+| **end to end** | **16.9 fps** | **19.3 fps** |
 
-19.3 fps end to end. Note the JPEG encode is nearly as expensive as the
-inference: capturing RGB565 means the frame cannot double as the stream, so
-previewing costs a software encode. That is a property of the pixel-domain
-pipeline, not of the model.
+The inference difference is input size, not architecture — the two runs use
+the same layers. 5x5 blocks give a 32x24 grid (768 positions), 8x8 give 20x15
+(300), so 2.6x the positions costs 1.5x the inference time. The shipped model
+uses 5x5 because the accuracy is worth the 2.4 fps; 8x8 is the configuration
+to use for the comparison against the DCT arm, where it is the exact
+equal-resolution control (an 8x8 block mean *is* the DCT DC coefficient).
+
+Note that the JPEG encode is nearly as expensive as the inference at 8x8, and
+still a third of the frame at 5x5: capturing RGB565 means the frame cannot
+double as the stream, so previewing costs a software encode. That is a
+property of the pixel-domain pipeline, not of the model — and it is exactly
+the cost the compressed-domain arm does not pay.
 
 ---
 

@@ -151,11 +151,15 @@ once), then read `/status`:
 
 Endpoints: `/` (UI), `:81/stream` (MJPEG), `/status`, `/config`, `/claim`.
 
-Expected timing: RGB565 → block-mean convert ~3.5 ms, inference ~21 ms,
-JPEG encode ~18.8 ms, total ~43.5 ms (19.3 fps). The JPEG encode is nearly
-as expensive as the inference because capturing RGB565 means the frame
-cannot double as the preview stream — a property of the pixel-domain
-pipeline, not of the model.
+Expected timing **at the default 5x5 blocks**: RGB565 → block-mean convert
+~3.4 ms, inference ~30.7 ms, JPEG encode ~18.2 ms, total ~52.3 ms (16.9 fps).
+At `--rgb-block-width 8 --rgb-block-height 8` it is ~3.5 / ~21.0 / ~18.8 ms,
+total ~43.5 ms (19.3 fps) — the difference is input size, not architecture:
+5x5 gives a 32x24 grid against 8x8's 20x15, so 2.6x the positions costs 1.5x
+the inference. The JPEG encode is a large share of the frame either
+way — nearly as expensive as the inference at 8x8, a third of it at 5x5 —
+because capturing RGB565 means the frame cannot double as the preview
+stream. That is a property of the pixel-domain pipeline, not of the model.
 
 ---
 

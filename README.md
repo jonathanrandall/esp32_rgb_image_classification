@@ -7,7 +7,7 @@ under [ESP-NN](https://github.com/espressif/esp-nn).
 
 Five classes: `computer`, `fruit`, `people`, `doors`, `car`.
 
-**81.7% int8 test accuracy on 2,304 input values per frame**, 80.0% balanced. Everything here
+**81.6% int8 test accuracy on 2,304 input values per frame**, 79.1% balanced. Everything here
 — training, quantization, C export, bit-exactness verification, and the
 firmware — is what produced the weights in
 `esp32_cam/esp32_rgb_cnn/include/model_weights.h`.
@@ -147,28 +147,28 @@ shipped weights:
 
 | split | float | QAT | int8 |
 |---|---:|---:|---:|
-| train | 79.3% | 84.5% | 86.7% |
-| val | 79.8% | 82.5% | 82.5% |
-| test | 78.7% | 81.5% | **81.7%** |
+| train | 83.6% | 85.1% | 86.1% |
+| val | 81.2% | 82.2% | 82.7% |
+| test | 81.0% | 81.7% | **81.6%** |
 
 Balanced (macro-averaged per-class recall), which weights every class equally:
-**80.0%** on test.
+**79.1%** on test.
 
 Per class, on the test split — precision alongside predicted share, because
 balanced accuracy is macro *recall* and is blind to a class that over-fires:
 
 | class | recall | precision | predicted share | actual share |
 |---|---:|---:|---:|---:|
-| computer | 89.6% | 85.6% | 39.4% | 37.7% |
-| fruit | 68.6% | 83.5% | 13.3% | 16.2% |
-| people | 67.1% | 71.0% | 16.0% | 16.9% |
-| doors | 87.2% | 85.4% | 16.6% | 16.3% |
-| car | 87.5% | 77.2% | 14.7% | 12.9% |
+| computer | 91.7% | 83.1% | 41.6% | 37.7% |
+| fruit | 70.0% | 83.1% | 13.6% | 16.2% |
+| people | 64.4% | 73.4% | 14.8% | 16.9% |
+| doors | 86.5% | 85.9% | 16.4% | 16.3% |
+| car | 83.0% | 79.5% | 13.5% | 12.9% |
 
 The compressed-domain arm on the same five classes and the same data:
-**79.2%** int8, 77.4% balanced.
+**78.8%** int8, 77.5% balanced.
 
-int8-vs-QAT prediction agreement: **99.8%**. The int8 reference is bit-exact
+int8-vs-QAT prediction agreement: **99.5%**. The int8 reference is bit-exact
 against the C export — see *Verification* below.
 
 QAT scoring above float is not a typo; quantization noise acts as a
@@ -199,6 +199,39 @@ still a third of the frame at 5x5: capturing RGB565 means the frame cannot
 double as the stream, so previewing costs a software encode. That is a
 property of the pixel-domain pipeline, not of the model — and it is exactly
 the cost the compressed-domain arm does not pay.
+
+### The same measurement on the compressed-domain arm
+
+Read from `GET /status` on `esp32_classifier`, same board, same five classes,
+while a client is streaming:
+
+| stage | ms |
+|---|---:|
+| capture | 11.5 |
+| DCT parse | 1.3 |
+| **inference** | **19.9** |
+| total | 32.6 |
+| **end to end** | **27.4 fps** (25.8-27.8, occasionally 28) |
+
+**There is no JPEG encode line, and that is the entire point.** The camera
+already produced a JPEG, the model reads its coefficients directly, and the
+same bytes go out as the preview stream. The pixel arm has to capture RGB565
+*and* then encode a JPEG purely so that something can be displayed — 18.2 ms
+of its 52.3 ms frame doing work the compressed-domain arm never does.
+
+Side by side, at the shipped settings:
+
+| | RGB (5x5) | DCT |
+|---|---:|---:|
+| inference | 30.7 ms | 19.9 ms |
+| end to end | 52.3 ms | 32.6 ms |
+| **frame rate** | **16.9 fps** | **27.4 fps** |
+| int8 test accuracy | **81.6%** | 78.8% |
+
+That is the trade this repository exists to measure: the pixel arm is about
+three points more accurate, the compressed arm about 1.6x the throughput. At the
+equal-resolution setting (`--rgb-block-width 8`, where a block mean *is* the
+DC coefficient) the pixel arm runs 19.3 fps against the same 27.4.
 
 ---
 

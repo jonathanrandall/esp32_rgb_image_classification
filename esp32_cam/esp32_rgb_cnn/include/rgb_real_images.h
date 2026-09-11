@@ -172,8 +172,8 @@ static const uint8_t REAL_IMAGE_FRUIT[3][24][32] = {
 #define REAL_NUM_VECTORS 2
 static const uint8_t *const REAL_IMAGES[REAL_NUM_VECTORS] = { (const uint8_t *)REAL_IMAGE_COMPUTER, (const uint8_t *)REAL_IMAGE_FRUIT };
 static const int8_t REAL_EXPECTED_LOGITS[REAL_NUM_VECTORS][5] = {
-    {   35,  -30,  -21,  -71,   18 },  /* computer */
-    {  -44,   49,  -10,  -22,  -35 }  /* fruit */
+    {   32,  -32,   -3,  -66,   16 },  /* computer */
+    {  -41,   59,  -23,  -27,  -38 }  /* fruit */
 };
 static const uint8_t REAL_EXPECTED_CLASS[REAL_NUM_VECTORS] = { 0, 1 };
 static const char *const REAL_CLASS_NAMES[REAL_NUM_VECTORS] = { "computer", "fruit" };

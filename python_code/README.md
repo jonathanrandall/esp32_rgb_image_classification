@@ -131,12 +131,71 @@ artifacts rather than remembered:
 | epochs | 60 float, 20 QAT |
 | augmentation | on |
 | seed | 1234 |
-| int8 test | 81.7% |
+| int8 test | 81.6% |
 
 Note the first conv stage is **32** channels here, not the `16,32,64` default —
 widening it was worth ~2 points. All four layers stay well under the ESP-NN
-filter-cache cliff (`out_ch * in_ch` below ~3,600, the largest here being 2,048),
-which is the constraint that matters on device rather than parameter count.
+filter-cache cliff, which is the constraint that matters on device rather than
+parameter count — see below, because it is not optional and nothing on the PC
+side will warn you about it.
+
+### Conv widths have a hard on-device ceiling: the ESP-NN cache cliff
+
+Choosing `--conv-channels` / `--extra-conv-channels` (or, on the DCT arm,
+`--lum-channels` / `--stride2-channels` / `--post-concat-channels`) looks like
+a pure accuracy decision made on the PC. It isn't. Past a threshold set by the
+ESP32-S3's **32 KB data cache**, a conv layer's on-device runtime stops
+tracking multiply-accumulates and starts tracking how many times ESP-NN
+re-reads its filter from flash or PSRAM.
+
+**The transition is a cliff, not a slope**, and nothing on the training side
+predicts it — not FLOPs, not parameter count, not the `cpu_inference_ms` the
+training script reports.
+
+The mechanism: ESP-NN's general convolution kernel streams the **entire filter
+buffer once per output pixel** — 80 times per layer at this input size. A
+filter that fits in cache is therefore free to re-read; one that does not is
+catastrophic.
+
+**The design rule, for every conv layer:**
+
+> `9 x out_ch x in_ch < 32,768`, i.e. **`out_ch x in_ch` under ~3,600**
+
+Measured on hardware, 2026-08-15, on the then-current 5-class 160x120 DCT
+model (inference has since come down to ~19 ms on the shipped 5-class model;
+the cliff behaviour is unchanged):
+
+| widths | `post_concat` | `extra_conv0` | inference |
+|---|---|---|---|
+| baseline `16/32/64/(32,)` | 64x36 = 2,304 | 32x64 = 2,048 | **21.9 ms total** |
+| doubled `32/64/128/(64,)` | 128x68 = 8,704 | 64x128 = 8,192 | those **two layers alone**: 125 ms + 230 ms |
+
+So doubling the filters cost roughly an order of magnitude in inference time,
+and bought **+0.9 points** of int8 accuracy (80.77% -> 81.68%). It was
+reverted.
+
+Two things make the ceiling tighter than it first appears:
+
+- **The product grows as width²**, so uniform widening has only about **1.25x**
+  of headroom before it falls off.
+- **The rule counts only the filter**, while the input and output buffers
+  compete for the same 32 KB. The baseline's `post_concat` working set is
+  already 30,944 B of 32,768 — 94% full.
+
+One corollary is genuinely free. The filter's rows are padded to a multiple of
+16, so `in_ch = 36` (row 108 -> 112) and `in_ch = 37` (row 111 -> 112) produce
+**identical** filter buffers: going from `--num-ac-coeffs 2` to `3` costs
+nothing in the layer that dominates inference. It does add ~300 B to that
+layer's *input* buffer, which is not free at 94% occupancy — so read
+`post_concat`'s per-stage time from `/status` after such a change rather than
+assuming.
+
+Reaching meaningfully wider layers needs a different *shape* of capacity, not
+more of the same: the rule caps a dense 3x3 conv at about 60 channels (a square
+60->60 layer is exactly 3,600), and a 64 KB cache would only take that to ~85.
+Depthwise-separable convolutions collapse the filter buffer by roughly 8x and
+would make 128-channel layers cache-resident, but nothing in this repository
+implements them — the shipped models deliberately stay under the cliff instead.
 
 `--classes` sets the model's class index order, and that order is baked into
 `MODEL_CLASS_NAMES` in the exported header — reorder the flag and the firmware's

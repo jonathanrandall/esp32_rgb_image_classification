@@ -61,8 +61,10 @@ static_assert(MODEL_NUM_STAGES == 7, "g_stage_us must match MODEL_NUM_STAGES");
 //
 // The DCT firmware has two published figures on this same board, and they are
 // 14-19x apart because of ESP-NN alone:
-//     ESP-NN:   21.9 ms inference,  39.8 ms end-to-end,  23.7 fps
+//     ESP-NN:   19.9 ms inference,  32.6 ms end-to-end,  27.4 fps
 //     portable: 306 ms inference,  ~428 ms end-to-end,   2.3 fps
+// (ESP-NN row re-measured 2026-09-11 on the shipped 5-class model; it was
+//  21.9 ms / 39.8 ms / 23.7 fps on the earlier 7-class configuration.)
 // Comparing across that boundary measures ESP-NN-vs-no-ESP-NN and buries the
 // DCT-vs-RGB architectural difference the whole exercise is about. So: match
 // the build. BUILD_HAS_ESP_NN below records which one this binary is, and it

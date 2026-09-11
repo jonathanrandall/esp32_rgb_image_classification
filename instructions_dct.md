@@ -209,7 +209,8 @@ Open `http://esp32cam_dct.local/` (or the IP from the serial log), then read
 | `model_forward_self_test` | `class_match` equal to `num_vectors` (25/25). `bit_exact` is often lower — ESP-NN's accelerated conv is not bit-exact against the portable reference, and a `max_abs_logit_diff` of 1 is normal |
 | `decoder_self_test` | `3/3`. `0/0` means the header above does not match `DCT_NUM_AC_COEFFS` and the test was skipped |
 | `reset_reason` | `poweron`. Read this before suspecting power supplies — it distinguishes `panic` from `brownout` |
-| `t_infer_ms` | ~19 ms for the shipped configuration |
+| `t_infer_ms` | ~19.9 ms for the shipped configuration |
+| `fps` | **~27** while a client is streaming (25.8-27.8, occasionally 28). Reads 0 when nothing is connected — capture is driven by the stream, so an idle board legitimately reports 0 fps and a `last_frame_age_ms` in the tens of seconds |
 
 Endpoints: `/` (UI), `:81/stream` (MJPEG), `:81/frame` (one frame + status),
 `/status`, `/claim`, `/sendlog`, `/control`.

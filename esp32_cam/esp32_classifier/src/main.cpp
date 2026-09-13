@@ -1631,7 +1631,30 @@ static bool init_camera() {
     // a lighting change, or if banding artifacts show up under flickering
     // light sources. See capture_time_issue.md.
     sensor->set_aec2(sensor, 0);
-    sensor->set_ae_level(sensor, -1);       // target slightly darker exposure (range -2..2) to pull DC back from saturation
+    // ae_level -1: target slightly darker exposure (range -2..2) to pull DC
+    // back from saturation. Briefly changed to +1 on 2026-09-12 and changed
+    // straight back, because the two OV2640 camera modules behave OPPOSITELY
+    // and this is the one worth optimising for. Measured over the stream,
+    // dequantized DC scaled as the model consumes it (coeff x QT / dc_scale):
+    //
+    //                        Freenove module        AI Thinker module
+    //   pixel mean @ ae+1        133.7                    74.5
+    //   q_dc mean                +7.8  (POSITIVE)        -52.2  (NEGATIVE)
+    //   |q_dc| max                125  of 127             113
+    //   frame rate               27.8 fps                33.3 fps
+    //
+    // On the Freenove module DC runs POSITIVE and sits at 125/127, which is
+    // exactly the saturation this setting exists to avoid -- and ae_level -1
+    // pulls its mean from +7.8 down to +1.4. On the AI Thinker module DC runs
+    // NEGATIVE, so -1 pushes it toward the -128 rail instead; +1 suits that
+    // one. There is no setting that is right for both, and no way to tell the
+    // modules apart in software (both report PID 0x26, OV2640).
+    //
+    // -1 is chosen because the Freenove module produces the far better image
+    // (1.8x brighter, AE not maxed out) and is the one being filmed. If you
+    // fit the AI Thinker module, set this to +1, or change it at runtime with
+    // /control?var=ae_level&val=1 -- no reflash needed.
+    sensor->set_ae_level(sensor, -1);
     sensor->set_gain_ctrl(sensor, 1);       // auto gain on
     sensor->set_saturation(sensor, 2);      // max (range -2..2) -- amplify whatever chroma signal exists
     sensor->set_special_effect(sensor, 0);  // 0 = no effect (rule out an accidental grayscale/tint mode)

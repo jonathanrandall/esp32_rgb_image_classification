@@ -7,7 +7,7 @@ under [ESP-NN](https://github.com/espressif/esp-nn).
 
 Five classes: `computer`, `fruit`, `people`, `doors`, `car`.
 
-**81.6% int8 test accuracy on 2,304 input values per frame**, 79.1% balanced. Everything here
+**80.8% int8 test accuracy on 2,304 input values per frame**, 78.3% balanced. Everything here
 — training, quantization, C export, bit-exactness verification, and the
 firmware — is what produced the weights in
 `esp32_cam/esp32_rgb_cnn/include/model_weights.h`.
@@ -147,28 +147,28 @@ shipped weights:
 
 | split | float | QAT | int8 |
 |---|---:|---:|---:|
-| train | 83.6% | 85.1% | 86.1% |
-| val | 81.2% | 82.2% | 82.7% |
-| test | 81.0% | 81.7% | **81.6%** |
+| train | 80.2% | 84.1% | 85.9% |
+| val | 81.2% | 81.2% | 80.8% |
+| test | 77.2% | 80.9% | **80.8%** |
 
 Balanced (macro-averaged per-class recall), which weights every class equally:
-**79.1%** on test.
+**78.3%** on test.
 
 Per class, on the test split — precision alongside predicted share, because
 balanced accuracy is macro *recall* and is blind to a class that over-fires:
 
 | class | recall | precision | predicted share | actual share |
 |---|---:|---:|---:|---:|
-| computer | 91.7% | 83.1% | 41.6% | 37.7% |
-| fruit | 70.0% | 83.1% | 13.6% | 16.2% |
-| people | 64.4% | 73.4% | 14.8% | 16.9% |
-| doors | 86.5% | 85.9% | 16.4% | 16.3% |
-| car | 83.0% | 79.5% | 13.5% | 12.9% |
+| computer | 91.1% | 83.0% | 41.4% | 37.7% |
+| fruit | 73.6% | 80.5% | 14.8% | 16.2% |
+| people | 61.0% | 76.1% | 13.5% | 16.9% |
+| doors | 84.4% | 83.2% | 16.5% | 16.3% |
+| car | 81.2% | 76.5% | 13.8% | 12.9% |
 
 The compressed-domain arm on the same five classes and the same data:
 **78.8%** int8, 77.5% balanced.
 
-int8-vs-QAT prediction agreement: **99.5%**. The int8 reference is bit-exact
+int8-vs-QAT prediction agreement: **99.1%**. The int8 reference is bit-exact
 against the C export — see *Verification* below.
 
 QAT scoring above float is not a typo; quantization noise acts as a
@@ -205,13 +205,27 @@ the cost the compressed-domain arm does not pay.
 Read from `GET /status` on `esp32_classifier`, same board, same five classes,
 while a client is streaming:
 
-| stage | ms |
-|---|---:|
-| capture | 11.5 |
-| DCT parse | 1.3 |
-| **inference** | **19.9** |
-| total | 32.6 |
-| **end to end** | **27.4 fps** (25.8-27.8, occasionally 28) |
+| stage | AI Thinker camera module | Freenove camera module |
+|---|---:|---:|
+| capture | **3.9** | 11.5 |
+| DCT parse | 2.0 | 1.3 |
+| **inference** | **21.1** | 19.9 |
+| total | 27.0 | 32.6 |
+| **end to end** | **33.3 fps** | 27.4 fps |
+
+> **Both columns are an ESP32-S3 board. Neither is an AI Thinker board.**
+> "AI Thinker camera" means the OV2640 *camera module* taken from an
+> AI Thinker ESP32-CAM and plugged into the same Freenove ESP32-S3 board —
+> the ribbon connector is the same, so the modules are interchangeable.
+> Nothing here was measured on an AI Thinker board, which carries an
+> original ESP32 rather than an S3 and has no ESP-NN acceleration, so its
+> numbers would not be comparable at all.
+
+**Both columns are the same firmware and the same weights** — only the camera
+module differs. Inference is fractionally *slower* in the fast column; the
+entire difference is how long the sensor takes to hand over a frame, 11.5 ms
+against 3.9 ms. Worth knowing before comparing any frame rate here against
+your own board: the camera module can be worth more than the model.
 
 **There is no JPEG encode line, and that is the entire point.** The camera
 already produced a JPEG, the model reads its coefficients directly, and the
@@ -219,19 +233,24 @@ same bytes go out as the preview stream. The pixel arm has to capture RGB565
 *and* then encode a JPEG purely so that something can be displayed — 18.2 ms
 of its 52.3 ms frame doing work the compressed-domain arm never does.
 
-Side by side, at the shipped settings:
+Side by side, at the shipped settings — **one board, one camera (AI Thinker),
+one scene, only the firmware swapped**:
 
 | | RGB (5x5) | DCT |
 |---|---:|---:|
-| inference | 30.7 ms | 19.9 ms |
-| end to end | 52.3 ms | 32.6 ms |
-| **frame rate** | **16.9 fps** | **27.4 fps** |
-| int8 test accuracy | **81.6%** | 78.8% |
+| inference | 30.7 ms | 21.1 ms |
+| JPEG encode | 18.2 ms | none |
+| end to end | 52.3 ms | 27.0 ms |
+| **frame rate** | **16.9 fps** | **33.3 fps** |
+| int8 test accuracy | **80.8%** | 78.8% |
 
 That is the trade this repository exists to measure: the pixel arm is about
-three points more accurate, the compressed arm about 1.6x the throughput. At the
+two points more accurate, the compressed arm just under **2x** the
+throughput. Measure both arms on the *same* camera — swapping the module is
+worth more frames per second than the entire architectural difference, so a
+comparison across two boards measures the cameras as much as the method. At the
 equal-resolution setting (`--rgb-block-width 8`, where a block mean *is* the
-DC coefficient) the pixel arm runs 19.3 fps against the same 27.4.
+DC coefficient) the pixel arm runs 19.3 fps against the same 33.3.
 
 ---
 

@@ -215,6 +215,13 @@ viewer is connected to.**
 
 ### The viewer's band matters, because the board is 2.4 GHz only
 
+> **Read the RESOLVED section at the end of this document before trusting the
+> airtime reasoning below.** The conclusion — keep the viewer on 5 GHz — is
+> still right, but the double-hop airtime mechanism given here was tested and
+> **disproven** as the primary cause on 2026-09-11. The real causes were this
+> particular laptop's 2.4 GHz radio and the old router.
+
+
 Observed 2026-08-24: the stream is noticeably better with the viewing computer
 on the router's **5 GHz** SSID and noticeably worse on **2.4 GHz** — same board,
 same position, same firmware.
@@ -281,36 +288,75 @@ instead of two.
   and a connector a 0 Ω resistor selects between them, so plugging one in without
   moving that resistor makes things worse.)
 
-### Still open: airtime, or the PC's own 2.4 GHz radio?
+### RESOLVED 2026-09-11: two causes, and H1 was wrong
 
-The −28 dBm control narrows the cause to two candidates, which make opposite
-predictions:
+This section used to pose the question as open, between:
 
 | | mechanism | predicts |
 |---|---|---|
-| **H1 airtime** | double hop on one channel, plus the ESP32 being a slow station at *any* RSSI (1×1 HT20, conservative rate control) | *any* 2.4 GHz viewer is slow |
-| **H2 the PC's radio** | laptop Wi-Fi/Bluetooth combo chips share one 2.4 GHz antenna and time-slice; an active BT device craters 2.4 GHz latency and leaves 5 GHz untouched | *other* 2.4 GHz viewers are fine |
+| **H1 airtime** | double hop on one channel, plus the ESP32 being a slow station at *any* RSSI | *any* 2.4 GHz viewer is slow |
+| **H2 the PC's radio** | laptop Wi-Fi/Bluetooth combo chips share one 2.4 GHz antenna; an active BT device craters 2.4 GHz latency and leaves 5 GHz untouched | *other* 2.4 GHz viewers are fine |
 
-H2 fits the evidence just as well as H1 and is independent of RSSI, which is why
-the −28 dBm result does not distinguish them.
+**The discriminating test was run, and H1 lost.** A phone on 2.4 GHz streamed
+smoothly while the laptop on 2.4 GHz did not — so "any 2.4 GHz viewer is slow"
+is false. **Everything above that rests on the double-hop airtime argument
+should be read as disproven as a primary cause.** It is left in place because
+the reasoning is a useful worked example of a plausible mechanism that turned
+out not to be the dominant one, not because it is correct.
 
-**The discriminating test:** stream to a phone on 2.4 GHz with the laptop off the
-network entirely. Smooth ⇒ H2, and the fix is local and free. Stuttering ⇒ H1,
-and 5 GHz or ethernet for the viewer is the answer.
+The real answer turned out to be **two independent causes**, either of which
+alone was enough to ruin the stream.
 
-Supporting tests on the PC, on 2.4 GHz:
+**Cause 1 — the laptop (H2, confirmed).** Its Intel AX201 is simply slow on
+2.4 GHz. Corroborated outside this project entirely: the same laptop was also
+the slow element against an RPi Zero on an unrelated project. No firmware
+change could ever have helped.
+
+**Cause 2 — the router (found 2026-09-11).** The old router's 2.4 GHz handling
+was bad for *every* client, not just the ESP32. With the board **idle** and
+nothing streaming:
+
+| host | avg RTT |
+|---|---:|
+| router itself | 2.9 ms |
+| a 5 GHz device | 5.1 ms |
+| **the HP printer (2.4 GHz)** | **84.9 ms** |
+| **the ESP32 (2.4 GHz, idle)** | **228 ms** (52-758) |
+
+Two unrelated 2.4 GHz devices, both terrible, while the router and a 5 GHz
+client answered in single-digit milliseconds. It ran 2.4 GHz on **channel 2**,
+overlapping both 1 and 6, with the printer's Wi-Fi Direct beaconing on the same
+channel. It also degraded further when other devices were active *on 5 GHz*,
+which is what made it look like a whole-house problem rather than a 2.4 GHz one.
+
+**The fix, both parts required:**
+
+1. **Replace the router.** An eero Pro 7 in its place; the board went from
+   4.5 fps streaming to its full ~17 fps *with the whole household connected*.
+2. **Keep the viewer off 2.4 GHz.** The laptop is pinned to the AP's 5 GHz
+   BSSID, because a single-SSID band-steering AP will otherwise park it on
+   2.4 GHz — 2.4 GHz reads as the stronger signal (95 vs 82 here) since lower
+   frequencies carry further. Gateway RTT 16.5 ms -> 3.8 ms.
+
+The ESP32s are 2.4 GHz only and cannot move, so keeping the viewer on 5 GHz is
+what stops it competing with them for airtime. That conclusion is unchanged
+from the old section — only the reason for it is different. It is not that any
+2.4 GHz viewer is doomed; it is that *this* laptop is bad on 2.4 GHz, and that
+the boards should have the band to themselves.
+
+**Diagnostic sequence worth reusing**, in this order — it separates the three
+layers quickly:
 
 ```bash
-rfkill block bluetooth                        # coexistence test
-iw dev <iface> get power_save
-sudo iw dev <iface> set power_save off
-ping -c 40 -i 0.3 <board-ip>                  # with NO stream running
+ping <router>          # laptop -> AP. Bad here = the laptop or the AP.
+ping <board>           # with NOTHING streaming. Bad here = the medium, not bitrate.
+ping <another device on the same band>   # bad too = the AP, not your device
 ```
 
-That last one separates "the medium is impaired" from "the medium is saturated".
-Bad *idle* ping on 2.4 GHz means no firmware change can help. Clean idle ping
-that collapses under stream load means the levers are bitrate-side — JPEG
-quality, frame size, or raw RGB565 instead of an encode.
+An idle board pinging at hundreds of milliseconds means no firmware change can
+help. A clean idle ping that collapses under stream load is the case where the
+bitrate levers — JPEG quality, frame size, RGB565 instead of an encode — are
+the right place to look.
 
 ## Diagnostic notes
 

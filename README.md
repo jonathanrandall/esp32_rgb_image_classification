@@ -427,14 +427,22 @@ Flash `esp32_cam/esp32_classifier` and note the board's address (it answers to
 
 ```bash
 # headless — capture 200 frames blind, ~1s apart
-python capture_board_frames.py --label people --count 200 --interval 1.0 --show-prediction
+python capture_board_frames.py --host esp32cam_dct.local --label people --count 200 --interval 1.0 --show-prediction
 
 # interactive — a live preview window; SPACE saves the frame on screen
-python capture_board_frames.py --interactive --label people
+python capture_board_frames.py --host esp32cam_dct.local --interactive --label people
 
 # a board that mDNS cannot find
 python capture_board_frames.py --host 192.168.1.125 --label car --count 50
 ```
+
+**Pass `--host` explicitly.** It defaults to `esp32cam_dct.local`, which only
+works if the firmware you flashed still defines that name — check
+`MDNS_HOSTNAME` in `esp32_cam/esp32_classifier/src/main.cpp`. If the name does
+not resolve, the tool has nothing to connect to: the headless mode times out,
+and the interactive window opens and then sits there with no frames, which
+looks like a camera fault rather than a name that does not exist. An IP always
+works.
 
 | option | default | what it does |
 |---|---|---|
@@ -458,7 +466,7 @@ continuously across runs so several sessions — different rooms, different ligh
 ### The interactive window
 
 ```bash
-python capture_board_frames.py --interactive --label people
+python capture_board_frames.py --host esp32cam_dct.local --interactive --label people
 ```
 
 Shows the live stream, the board's current prediction, and a per-class tally.
